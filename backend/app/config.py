@@ -1,0 +1,269 @@
+"""Load the sample YAML config into a mutable object the services share."""
+
+from __future__ import annotations
+
+from copy import deepcopy
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import yaml
+
+ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_CONFIG_PATH = ROOT / "config" / "default.yaml"
+
+JOINTS = (
+    "base",
+    "shoulder",
+    "elbow",
+    "wrist_vertical",
+    "wrist_rotation",
+    "gripper",
+)
+ARM_JOINTS = JOINTS[:5]
+
+
+@dataclass
+class Pose:
+    base: float
+    shoulder: float
+    elbow: float
+    wrist_vertical: float
+    wrist_rotation: float
+
+    def angles(self) -> dict[str, float]:
+        return {
+            "base": self.base,
+            "shoulder": self.shoulder,
+            "elbow": self.elbow,
+            "wrist_vertical": self.wrist_vertical,
+            "wrist_rotation": self.wrist_rotation,
+        }
+
+
+@dataclass
+class Zone:
+    id: str
+    x: float
+    y: float
+    reachable: bool
+    approach: Pose
+    grasp: Pose
+    lift: Pose
+
+
+@dataclass
+class SceneObject:
+    id: str
+    label: str
+    kind: str
+    color: str
+    close_angle: float
+    zone: str | None
+    localizable: bool
+    image: dict | None = None
+
+    @property
+    def name(self) -> str:
+        if self.kind == "fruit" and self.label == "orange":
+            return "orange fruit"
+        return f"{self.color} {self.kind}".replace("_", " ")
+
+
+@dataclass
+class Config:
+    raw: dict
+    server_host: str
+    server_port: int
+    mode: str
+    motion_timeout_s: float
+    sim_joint_s: float
+    pose_hz: float
+    lift_segments: int
+    sample_hold_s: float
+    enose_step_s: float
+    serial_mode: str
+    serial_port: str
+    baud: int
+    ready_token: str
+    ready_timeout_s: float
+    stop_timeout_s: float
+    camera_mode: str
+    camera_index: int
+    width: int
+    height: int
+    stale_after_s: float
+    llm_enabled: bool
+    llm_api: str
+    llm_base_url: str
+    llm_model: str
+    llm_timeout_s: float
+    vlm_enabled: bool
+    vlm_api: str
+    vlm_base_url: str
+    vlm_model: str
+    vlm_timeout_s: float
+    enose_mode: str
+    enose_base_url: str
+    enose_timeout_s: float
+    x_min: float
+    x_max: float
+    y_min: float
+    y_max: float
+    zone_radius_mm: float
+    transit_shoulder: float
+    clearance_shoulder_min: float
+    clearance_shoulder_max: float
+    forbidden_elbow_below: float
+    forbidden_shoulder_above: float
+    joint_limits: dict[str, tuple[float, float]]
+    gripper_open: float
+    gripper_closed: float
+    park: Pose
+    sample: Pose
+    scan: list[Pose]
+    zones: dict[str, Zone]
+    objects: dict[str, SceneObject]
+    calibration: dict
+    pose_errors: list[str] = field(default_factory=list)
+
+    @classmethod
+    def load(cls, path: Path | None = None) -> "Config":
+        path = path or DEFAULT_CONFIG_PATH
+        data = yaml.safe_load(path.read_text())
+        return cls.from_dict(data)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Config":
+        data = deepcopy(data)
+        ex = data["execution"]
+        ser = data["serial"]
+        cam = data["camera"]
+        llm = data["llm"]
+        vlm = data["vlm"]
+        nose = data["enose"]
+        space = data["workspace"]
+        limits = {
+            name: (float(spec["min"]), float(spec["max"]))
+            for name, spec in data["joints"].items()
+        }
+        poses = data["poses"]
+        zones = {}
+        for zid, spec in data["zones"].items():
+            zones[zid] = Zone(
+                id=zid,
+                x=float(spec["x"]),
+                y=float(spec["y"]),
+                reachable=bool(spec["reachable"]),
+                approach=_pose(spec["approach"]),
+                grasp=_pose(spec["grasp"]),
+                lift=_pose(spec["lift"]),
+            )
+        objects = {}
+        for oid, spec in data["objects"].items():
+            objects[oid] = SceneObject(
+                id=oid,
+                label=spec["label"],
+                kind=spec["kind"],
+                color=spec["color"],
+                close_angle=float(spec["close_angle"]),
+                zone=spec.get("zone"),
+                localizable=bool(spec.get("localizable", True)),
+                image=spec.get("image"),
+            )
+        cfg = cls(
+            raw=data,
+            server_host=data["server"]["host"],
+            server_port=int(data["server"]["port"]),
+            mode=ex["mode"],
+            motion_timeout_s=float(ex["motion_timeout_s"]),
+            sim_joint_s=float(ex["sim_joint_s"]),
+            pose_hz=float(ex.get("pose_hz", 30)),
+            lift_segments=int(ex["lift_segments"]),
+            sample_hold_s=float(ex["sample_hold_s"]),
+            enose_step_s=float(ex["enose_step_s"]),
+            serial_mode=ser["mode"],
+            serial_port=ser.get("port") or "",
+            baud=int(ser["baud"]),
+            ready_token=ser["ready_token"],
+            ready_timeout_s=float(ser["ready_timeout_s"]),
+            stop_timeout_s=float(ser["stop_timeout_s"]),
+            camera_mode=cam["mode"],
+            camera_index=int(cam["index"]),
+            width=int(cam["width"]),
+            height=int(cam["height"]),
+            stale_after_s=float(cam["stale_after_s"]),
+            llm_enabled=bool(llm["enabled"]),
+            llm_api=str(llm.get("api") or ("ollama" if ":11434" in str(llm["base_url"]) else "openai")),
+            llm_base_url=llm["base_url"],
+            llm_model=llm["model"],
+            llm_timeout_s=float(llm["timeout_s"]),
+            vlm_enabled=bool(vlm["enabled"]),
+            vlm_api=str(vlm.get("api") or ("ollama" if ":11434" in str(vlm["base_url"]) else "openai")),
+            vlm_base_url=vlm["base_url"],
+            vlm_model=vlm["model"],
+            vlm_timeout_s=float(vlm["timeout_s"]),
+            enose_mode=nose["mode"],
+            enose_base_url=nose["base_url"],
+            enose_timeout_s=float(nose["timeout_s"]),
+            x_min=float(space["x_min"]),
+            x_max=float(space["x_max"]),
+            y_min=float(space["y_min"]),
+            y_max=float(space["y_max"]),
+            zone_radius_mm=float(space["zone_radius_mm"]),
+            transit_shoulder=float(space["transit_shoulder"]),
+            clearance_shoulder_min=float(space["clearance_shoulder_min"]),
+            clearance_shoulder_max=float(space["clearance_shoulder_max"]),
+            forbidden_elbow_below=float(space["forbidden_elbow_below"]),
+            forbidden_shoulder_above=float(space["forbidden_shoulder_above"]),
+            joint_limits=limits,
+            gripper_open=float(data["joints"]["gripper"]["open"]),
+            gripper_closed=float(data["joints"]["gripper"]["closed"]),
+            park=_pose(poses["park"]),
+            sample=_pose(poses["sample"]),
+            scan=[_pose(item) for item in poses["scan"]],
+            zones=zones,
+            objects=objects,
+            calibration=data["calibration"],
+        )
+        cfg.pose_errors = validate_taught_poses(cfg)
+        return cfg
+
+
+def _pose(spec: dict) -> Pose:
+    return Pose(
+        base=float(spec["base"]),
+        shoulder=float(spec["shoulder"]),
+        elbow=float(spec["elbow"]),
+        wrist_vertical=float(spec["wrist_vertical"]),
+        wrist_rotation=float(spec["wrist_rotation"]),
+    )
+
+
+def validate_taught_poses(cfg: Config) -> list[str]:
+    """Refuse to boot a motion stack whose taught poses already break the rules."""
+    from app.geometry import pose_problem
+
+    errors = []
+    named = [("park", cfg.park), ("sample", cfg.sample)]
+    named += [(f"scan[{i}]", pose) for i, pose in enumerate(cfg.scan)]
+    for zone in cfg.zones.values():
+        named.append((f"{zone.id}.approach", zone.approach))
+        named.append((f"{zone.id}.grasp", zone.grasp))
+        named.append((f"{zone.id}.lift", zone.lift))
+    for name, pose in named:
+        problem = pose_problem(pose.angles(), cfg, gripper=cfg.gripper_open)
+        if problem:
+            errors.append(f"{name}: {problem}")
+        problem = pose_problem(pose.angles(), cfg, gripper=cfg.gripper_closed)
+        if problem:
+            errors.append(f"{name} with gripper closed: {problem}")
+    low, high = cfg.joint_limits["shoulder"]
+    if not low <= cfg.transit_shoulder <= high:
+        errors.append("transit_shoulder is outside the shoulder limits")
+    for obj in cfg.objects.values():
+        lo, hi = cfg.joint_limits["gripper"]
+        if not lo <= obj.close_angle <= hi:
+            errors.append(f"{obj.id} close_angle {obj.close_angle} is outside {lo}–{hi}")
+        if obj.zone and obj.zone not in cfg.zones:
+            errors.append(f"{obj.id} refers to unknown zone {obj.zone}")
+    return errors

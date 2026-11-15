@@ -1,0 +1,202 @@
+# PASSA pick-and-smell prototype. Defaults run entirely on this computer:
+# mock camera, mock Arduino, mock E-nose, dry-run motion.
+
+server:
+  host: 127.0.0.1
+  port: 8000
+
+execution:
+  # dry_run validates and simulates motion. armed sends UART through the motion controller.
+  mode: dry_run
+  motion_timeout_s: 8
+  sim_joint_s: 0.2
+  # How often a dry-run move publishes the commanded pose while a joint is traveling.
+  pose_hz: 30
+  lift_segments: 3
+  sample_hold_s: 0.6
+  enose_step_s: 0.35
+
+serial:
+  mode: mock # mock | hardware
+  port: ""
+  baud: 115200
+  ready_token: "READY Braccio UART"
+  ready_timeout_s: 6
+  stop_timeout_s: 1.5
+
+camera:
+  mode: mock # mock | hardware
+  index: 0
+  width: 640
+  height: 480
+  stale_after_s: 2.0
+
+llm:
+  # Ollama chat API. The dashboard can point this at another computer's IP.
+  enabled: true
+  api: ollama
+  base_url: "http://127.0.0.1:11434"
+  model: "llama3.2:latest"
+  timeout_s: 12
+
+vlm:
+  # Ollama's native chat API. llava:latest is the local vision model.
+  enabled: true
+  api: ollama
+  base_url: "http://127.0.0.1:11434"
+  model: "llava:latest"
+  timeout_s: 25
+
+enose:
+  # mock labels every reading. unavailable reports that sampling could not be performed.
+  # hardware calls {base_url}/baseline, /sample, and /purge.
+  mode: mock # mock | hardware | unavailable
+  base_url: "http://127.0.0.1:8090"
+  timeout_s: 4
+
+# Validated tabletop, millimetres, origin at the base, +X forward when the base servo reads 90°.
+workspace:
+  x_min: 100
+  x_max: 260
+  y_min: -140
+  y_max: 140
+  zone_radius_mm: 40
+  # Shoulder must sit in this band before the base is allowed to rotate.
+  transit_shoulder: 75
+  clearance_shoulder_min: 40
+  clearance_shoulder_max: 115
+  # Starter collision rule: a low elbow combined with a dropped shoulder is rejected.
+  forbidden_elbow_below: 35
+  forbidden_shoulder_above: 140
+
+joints:
+  base: {min: 0, max: 180}
+  shoulder: {min: 15, max: 165}
+  elbow: {min: 0, max: 180}
+  wrist_vertical: {min: 0, max: 180}
+  wrist_rotation: {min: 0, max: 180}
+  gripper: {min: 10, max: 73, open: 10, closed: 73}
+
+# Taught poses. Gripper angle is filled in by the sequencer (open, calibrated close, or hold).
+# Replace these with poses you jog to on the real arm, then run a dry-run before arming.
+poses:
+  park:
+    base: 90
+    shoulder: 75
+    elbow: 100
+    wrist_vertical: 90
+    wrist_rotation: 90
+  sample:
+    base: 90
+    shoulder: 50
+    elbow: 120
+    wrist_vertical: 70
+    wrist_rotation: 90
+  scan:
+    - name: left
+      base: 125
+      shoulder: 70
+      elbow: 105
+      wrist_vertical: 80
+      wrist_rotation: 90
+    - name: center
+      base: 90
+      shoulder: 65
+      elbow: 110
+      wrist_vertical: 75
+      wrist_rotation: 90
+    - name: right
+      base: 55
+      shoulder: 70
+      elbow: 105
+      wrist_vertical: 80
+      wrist_rotation: 90
+
+zones:
+  left:
+    x: 170
+    y: 110
+    reachable: true
+    approach: {base: 125, shoulder: 80, elbow: 100, wrist_vertical: 80, wrist_rotation: 90}
+    grasp: {base: 125, shoulder: 110, elbow: 82, wrist_vertical: 70, wrist_rotation: 90}
+    lift: {base: 125, shoulder: 70, elbow: 108, wrist_vertical: 80, wrist_rotation: 90}
+  center:
+    x: 170
+    y: 0
+    reachable: true
+    approach: {base: 90, shoulder: 80, elbow: 100, wrist_vertical: 80, wrist_rotation: 90}
+    grasp: {base: 90, shoulder: 112, elbow: 80, wrist_vertical: 68, wrist_rotation: 90}
+    lift: {base: 90, shoulder: 68, elbow: 108, wrist_vertical: 78, wrist_rotation: 90}
+  right:
+    x: 170
+    y: -110
+    reachable: true
+    approach: {base: 55, shoulder: 80, elbow: 100, wrist_vertical: 80, wrist_rotation: 90}
+    grasp: {base: 55, shoulder: 110, elbow: 82, wrist_vertical: 70, wrist_rotation: 90}
+    lift: {base: 55, shoulder: 70, elbow: 108, wrist_vertical: 80, wrist_rotation: 90}
+  front:
+    x: 245
+    y: 0
+    reachable: true
+    approach: {base: 90, shoulder: 78, elbow: 112, wrist_vertical: 74, wrist_rotation: 90}
+    grasp: {base: 90, shoulder: 108, elbow: 90, wrist_vertical: 72, wrist_rotation: 90}
+    lift: {base: 90, shoulder: 64, elbow: 114, wrist_vertical: 76, wrist_rotation: 90}
+  far:
+    x: 340
+    y: 0
+    reachable: false
+    approach: {base: 90, shoulder: 80, elbow: 100, wrist_vertical: 80, wrist_rotation: 90}
+    grasp: {base: 90, shoulder: 112, elbow: 80, wrist_vertical: 68, wrist_rotation: 90}
+    lift: {base: 90, shoulder: 68, elbow: 108, wrist_vertical: 78, wrist_rotation: 90}
+
+# Mock scene. close_angle is the calibrated gripper servo angle for that object (10 open, 73 shut).
+objects:
+  orange_fruit:
+    label: orange
+    kind: fruit
+    color: orange
+    close_angle: 42
+    zone: front
+    localizable: true
+  orange_cup:
+    label: cup
+    kind: cup
+    color: orange
+    close_angle: 60
+    zone: right
+    localizable: true
+  blue_cup:
+    label: cup
+    kind: cup
+    color: blue
+    close_angle: 58
+    zone: center
+    localizable: true
+  green_block:
+    label: block
+    kind: block
+    color: green
+    close_angle: 48
+    zone: far
+    localizable: true
+  red_block:
+    label: block
+    kind: block
+    color: red
+    close_angle: 48
+    zone: null
+    localizable: false
+    image: {u: 90, v: 70, w: 48, h: 40}
+
+# Starter camera model. Leave complete: false until you measure the real wrist camera.
+# While this is false, an image pixel is never converted into a servo command.
+calibration:
+  complete: false
+  image_width: 640
+  image_height: 480
+  intrinsics: {fx: 820, fy: 820, cx: 320, cy: 240}
+  # Camera mount relative to the wrist, millimetres and degrees. Pitch is downward.
+  camera_in_wrist: {x: 0, y: 35, z: 20, roll: 0, pitch: 55, yaw: 0}
+  table_z_mm: 0
+  max_range_mm: 800
+  links: {base_height: 70, shoulder: 125, elbow: 125, wrist: 60}
