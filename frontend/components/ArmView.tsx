@@ -8,6 +8,7 @@ type RGB = [number, number, number];
 
 const SCALE = 0.0118;
 const BASE: V = [-2.2, 0, 0.15];
+const TABLE_SIDE_MM = 1200;
 const LINKS = { base: 70, shoulder: 125, elbow: 125, wrist: 58 };
 const ZONES: Record<string, { x: number; y: number }> = {
   left: { x: 170, y: 110 },
@@ -97,14 +98,40 @@ const NAMED: Record<string, RGB> = {
   red: [200, 70, 60],
   purple: [150, 110, 190],
   yellow: [210, 180, 70],
+  white: [236, 236, 232],
+  gray: [148, 150, 148],
+  grey: [148, 150, 148],
+  black: [46, 48, 50],
+  clear: [206, 222, 228],
+  brown: [142, 96, 58],
+  pink: [214, 140, 160],
 };
 
 function objectKind(name: string) {
   const text = name.toLowerCase();
-  if (text.includes("cup")) return "cup";
+  if (text.includes("mouse")) return "mouse";
+  if (text.includes("phone")) return "phone";
+  if (text.includes("bottle")) return "bottle";
+  if (text.includes("cup") || text.includes("glass")) return "cup";
   if (text.includes("block")) return "block";
-  if (text.includes("orange") || text.includes("fruit")) return "orange";
+  if (text.includes("orange") || text.includes("fruit") || text.includes("apple")) return "orange";
   return "block";
+}
+
+function tableTwin(item: ObservationItem): { at: V; wide: number; tall: number } | null {
+  const zone = item.zone ? ZONES[item.zone] : undefined;
+  if (zone) return { at: place(zone.x, zone.y, 0), wide: 42, tall: 70 };
+  if (item.bbox.length < 4) return null;
+  const [u, v, w, h] = item.bbox;
+  const across = clamp((u + w / 2) / 640, 0, 1);
+  const depth = 1 - clamp((v + h / 2) / 480, 0, 1);
+  const forward = 80 + depth * (TABLE_SIDE_MM - 160);
+  const lateral = (across - 0.5) * (TABLE_SIDE_MM - 80);
+  return {
+    at: place(forward, lateral, 0),
+    wide: clamp((w / 640) * TABLE_SIDE_MM, 40, 220),
+    tall: clamp((h / 480) * 360, 30, 200),
+  };
 }
 
 interface Scene {
@@ -203,7 +230,7 @@ export default function ArmView(props: Omit<Scene, "yaw" | "pitch" | "dragging">
 
   return (
     <div className="arm-view">
-      <canvas ref={canvasRef} aria-label="3D view of the arm following the commanded joint angles. Drag to orbit." />
+      <canvas ref={canvasRef} aria-label="3D view of the arm and the objects on the table. Drag to orbit." />
       <button
         type="button"
         className="arm-orbit"
@@ -239,8 +266,9 @@ function paint(
   ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
   ctx.clearRect(0, 0, width, height);
 
-  const focus: V = [-0.15, 0.95, 0.1];
-  const distance = width < 520 ? 12.6 : 11.6;
+  const tableSide = TABLE_SIDE_MM * SCALE;
+  const focus: V = [BASE[0] + tableSide / 2, 0.45, BASE[2]];
+  const distance = width < 520 ? 30 : 26;
   const eye = add(focus, [
     Math.sin(scene.yaw) * Math.cos(scene.pitch) * distance,
     Math.sin(scene.pitch) * distance,
@@ -374,26 +402,35 @@ function paint(
     ctx.stroke();
   };
 
-  orientedBox([0, -0.14, 0], [7.35, 0.28, 4.7], [[1, 0, 0], [0, 1, 0], [0, 0, 1]], PALETTE.bench);
+  const nearX = BASE[0];
+  const farX = BASE[0] + tableSide;
+  const leftZ = BASE[2] - tableSide / 2;
+  const rightZ = BASE[2] + tableSide / 2;
+  orientedBox([(nearX + farX) / 2, -0.14, BASE[2]], [tableSide, 0.28, tableSide], [[1, 0, 0], [0, 1, 0], [0, 0, 1]], PALETTE.bench);
   drawFaces();
-  for (let x = -3.5; x <= 3.5; x += 0.5) strokeLine([x, 0.008, -2.2], [x, 0.008, 2.2], css(PALETTE.grid), 0.6);
-  for (let z = -2; z <= 2; z += 0.5) strokeLine([-3.6, 0.008, z], [3.6, 0.008, z], css(PALETTE.grid), 0.6);
+  const grid = 100 * SCALE;
+  for (let x = nearX; x <= farX + 0.01; x += grid) strokeLine([x, 0.008, leftZ], [x, 0.008, rightZ], css(PALETTE.grid), 0.6);
+  for (let z = leftZ; z <= rightZ + 0.01; z += grid) strokeLine([nearX, 0.008, z], [farX, 0.008, z], css(PALETTE.grid), 0.6);
 
   const pose = armPoints(angles);
   const items = scene.items.length ? scene.items : scene.showDefaultScene ? DEFAULT_SCENE : [];
   const drawn = items.flatMap((item) => {
-    if (item.held) return [{ item, at: add(pose.tip, mul(pose.hand, 0.12)) }];
-    const zone = item.zone ? ZONES[item.zone] : undefined;
-    if (!zone) return [];
-    return [{ item, at: place(zone.x, zone.y, 0) }];
+    const twin = tableTwin(item);
+    if (!twin) return [];
+    if (item.held) {
+      return [{ item, at: add(pose.tip, mul(pose.hand, 0.12)), wide: twin.wide, tall: twin.tall, lifted: true }];
+    }
+    return [{ item, ...twin, lifted: false }];
   });
 
-  for (const { item, at } of drawn) {
-    if (item.id === scene.selectedId && !item.held) {
-      const marker = ring([at[0], 0.02, at[2]], [1, 0, 0], [0, 0, 1], 0.42, 28);
-      for (let index = 0; index < marker.length; index += 1) {
-        strokeLine(marker[index], marker[(index + 1) % marker.length], css(PALETTE.accent), 1.4);
-      }
+  for (const { item, at, wide } of drawn) {
+    if (item.held) continue;
+    const radius = Math.max(0.22, wide * SCALE * 0.62);
+    const marker = ring([at[0], 0.02, at[2]], [1, 0, 0], [0, 0, 1], radius, 28);
+    const color = item.id === scene.selectedId ? css(PALETTE.accent) : css(PALETTE.grid);
+    const weight = item.id === scene.selectedId ? 1.6 : 0.8;
+    for (let index = 0; index < marker.length; index += 1) {
+      strokeLine(marker[index], marker[(index + 1) % marker.length], color, weight);
     }
   }
 
@@ -443,20 +480,51 @@ function paint(
     orientedBox(pad, [0.07, 0.28, 0.09], [fingerSide, fingerUp, pose.hand], PALETTE.metal);
   }
 
-  for (const { item, at } of drawn) {
-    const color = NAMED[item.color] ?? NAMED[objectKind(item.name)] ?? NAMED.yellow;
+  const labels: Array<{ at: V; name: string; selected: boolean }> = [];
+  for (const { item, at, wide, tall, lifted } of drawn) {
+    const color = NAMED[item.color] ?? NAMED.gray;
     const kind = objectKind(item.name);
-    const center: V = item.held ? at : [at[0], kind === "cup" ? 0.28 : 0.24, at[2]];
+    const span = wide * SCALE;
+    const rise = tall * SCALE;
+    const ground: V = lifted ? at : [at[0], 0, at[2]];
+    const top = (height: number) => add(ground, [0, lifted ? height / 2 : height, 0]);
+    let crown = rise;
     if (kind === "orange") {
-      sphere(center, 0.24, color);
-    } else if (kind === "cup") {
-      tube(add(center, [0, -0.24, 0]), add(center, [0, 0.22, 0]), 0.14, 0.18, color, 14);
-      tube(add(center, [0, 0.22, 0]), add(center, [0, 0.25, 0]), 0.16, 0.16, PALETTE.slot, 14);
+      const radius = Math.max(span, rise) * 0.42;
+      sphere(add(ground, [0, lifted ? 0 : radius, 0]), radius, color);
+      crown = radius * (lifted ? 1 : 2);
+    } else if (kind === "cup" || kind === "bottle") {
+      const height = kind === "bottle" ? Math.max(rise, span * 1.7) : Math.max(rise, span * 0.9);
+      const radius = span * (kind === "bottle" ? 0.28 : 0.42);
+      const foot = lifted ? add(ground, [0, -height / 2, 0]) : ground;
+      const lip = add(foot, [0, height, 0]);
+      tube(foot, lip, radius * 0.82, radius, color, 16);
+      tube(lip, add(lip, [0, 0.035, 0]), radius * 0.9, radius * 0.9, PALETTE.slot, 16);
+      crown = height + 0.04;
+    } else if (kind === "mouse") {
+      const height = Math.max(0.08, Math.min(rise, span * 0.38));
+      orientedBox(add(ground, [0, lifted ? 0 : height / 2, 0]), [span, height, span * 0.62], [[1, 0, 0], [0, 1, 0], [0, 0, 1]], color);
+      crown = height;
+    } else if (kind === "phone") {
+      const height = Math.max(0.04, span * 0.12);
+      orientedBox(add(ground, [0, lifted ? 0 : height / 2, 0]), [span * 0.55, height, span], [[1, 0, 0], [0, 1, 0], [0, 0, 1]], color);
+      crown = height;
     } else {
-      orientedBox(center, [0.42, 0.36, 0.42], [[1, 0, 0], [0, 1, 0], [0, 0, 1]], color);
+      const height = Math.max(rise, span * 0.7);
+      orientedBox(add(ground, [0, lifted ? 0 : height / 2, 0]), [span, height, span * 0.8], [[1, 0, 0], [0, 1, 0], [0, 0, 1]], color);
+      crown = height;
     }
+    labels.push({ at: add(top(crown), [0, 0.12, 0]), name: item.name, selected: item.id === scene.selectedId });
   }
   drawFaces();
+  ctx.font = "12px sans-serif";
+  ctx.textAlign = "center";
+  for (const label of labels) {
+    const screen = project(label.at);
+    if (!screen) continue;
+    ctx.fillStyle = label.selected ? css(PALETTE.accent) : css(neutral(0.78));
+    ctx.fillText(label.name, screen[0], screen[1]);
+  }
 
   if (scene.phase === "sampling") {
     const held = drawn.find((entry) => entry.item.held);
