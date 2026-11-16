@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import ArmView from "./ArmView";
 import { ArmState, BACKEND, DeviceList, JOINTS, JointName } from "../lib/types";
+import { VoiceLang, hasThai, listen, speak, speechSupported, voiceLooksWrong } from "../lib/voice";
 
 const PHASES = [
   ["scanning", "Scanning"],
@@ -54,7 +55,18 @@ export default function Dashboard() {
   const [llmNote, setLlmNote] = useState("");
   const [notice, setNotice] = useState("");
   const [commandText, setCommandText] = useState("");
+  const [voiceLang, setVoiceLang] = useState<VoiceLang>("th-TH");
+  const [voiceLoop, setVoiceLoop] = useState(false);
+  const [listening, setListening] = useState(false);
+  const [voiceNote, setVoiceNote] = useState("");
   const uartRef = useRef<HTMLDivElement>(null);
+  const spokenQuestion = useRef("");
+  const voiceLoopRef = useRef(false);
+  const voiceLangRef = useRef<VoiceLang>("th-TH");
+  const listeningStop = useRef<(() => void) | null>(null);
+  const askCycle = useRef(0);
+  const wasRunning = useRef(false);
+  const askForVoiceCommandRef = useRef<() => Promise<void>>(async () => undefined);
 
   useEffect(() => {
     let source: EventSource | null = null;
@@ -81,6 +93,28 @@ export default function Dashboard() {
       window.clearInterval(poll);
     };
   }, []);
+
+  useEffect(() => {
+    voiceLoopRef.current = voiceLoop;
+  }, [voiceLoop]);
+
+  useEffect(() => {
+    voiceLangRef.current = voiceLang;
+  }, [voiceLang]);
+
+  useEffect(() => {
+    const question = state?.mission.clarification?.question?.trim() || "";
+    if (!question) {
+      spokenQuestion.current = "";
+      return;
+    }
+    if (spokenQuestion.current === question) return;
+    spokenQuestion.current = question;
+    const line = /can't detect|cannot see|did not (answer|choose)|ตรวจไม่พบ|ไม่เห็น/i.test(question)
+      ? question
+      : `I can't detect that object. ${question}`;
+    void speak(line, hasThai(line) ? "th-TH" : "en-US");
+  }, [state?.mission.clarification?.question]);
 
   useEffect(() => {
     let cancel = false;
@@ -182,21 +216,130 @@ export default function Dashboard() {
     try {
       const payload = await post(path, body);
       const missionState = payload?.state?.mission ?? payload?.mission;
+      if (missionState?.plan?.intent === "noop" && missionState.plan.summary) {
+        const line = String(missionState.plan.summary);
+        setNotice(line);
+        void speak(line, hasThai(line) ? "th-TH" : voiceLangRef.current);
+      }
       if (missionState?.status === "ready" && missionState.plan && !missionState.running) {
         await post("/api/run");
       }
+      return payload;
     } catch {
       setOffline(true);
       setNotice("The Python backend is not reachable.");
+      return null;
     } finally {
       setBusy(false);
     }
+  }
+
+  function stopListening() {
+    listeningStop.current?.();
+    listeningStop.current = null;
+    setListening(false);
+  }
+
+  async function askForVoiceCommand() {
+    if (!voiceLoopRef.current) return;
+    const cycle = ++askCycle.current;
+    const lang = voiceLangRef.current;
+    stopListening();
+    setVoiceNote(lang === "th-TH" ? "กำลังขอคำสั่ง..." : "Asking for a command...");
+    // Speak only one language before listening. Mixing English into the Thai
+    // prompt makes Chrome's Thai speech recognition less reliable.
+    const prompt = lang === "th-TH" ? "กรุณาออกคำสั่งให้หุ่นยนต์ได้เลย" : "Please command the robot.";
+    await speak(prompt, lang);
+    if (!voiceLoopRef.current || cycle !== askCycle.current) return;
+    if (!speechSupported()) {
+      setVoiceNote("This browser cannot listen. Use Chrome, or type the command.");
+      return;
+    }
+    setListening(true);
+    setVoiceNote(lang === "th-TH" ? "กำลังฟังภาษาไทย... พูดคำสั่งได้เลย" : "Listening... say the command.");
+    const session = listen(lang, 10000, lang === "th-TH" ? 1000 : 800);
+    listeningStop.current = session.stop;
+    try {
+      const heard = (await session.promise).trim();
+      if (!voiceLoopRef.current || cycle !== askCycle.current) return;
+      if (!heard || voiceLooksWrong(lang, heard)) {
+        setVoiceNote(
+          lang === "th-TH"
+            ? `ไม่ได้ยินภาษาไทยชัดเจน${heard ? ` (ได้ยินว่า: ${heard})` : ""}. พูดอีกครั้ง`
+            : "No clear command heard. Trying again.",
+        );
+        setListening(false);
+        await speak(lang === "th-TH" ? "ไม่ได้ยินภาษาไทยชัดเจน กรุณาพูดอีกครั้ง" : "I did not hear a clear command. Please say it again.", lang);
+        window.setTimeout(() => {
+          if (voiceLoopRef.current) void askForVoiceCommandRef.current();
+        }, 500);
+        return;
+      }
+      setCommandText(heard);
+      setVoiceNote(heard);
+      setListening(false);
+      await speak(lang === "th-TH" ? `ได้ยินว่า ${heard}` : `I heard ${heard}`, lang);
+      if (!voiceLoopRef.current || cycle !== askCycle.current) return;
+      await startMission("/api/command", { text: heard });
+    } catch (error) {
+      if (!voiceLoopRef.current || cycle !== askCycle.current) return;
+      setListening(false);
+      setVoiceNote(error instanceof Error ? error.message : "Microphone failed.");
+      window.setTimeout(() => {
+        if (voiceLoopRef.current) void askForVoiceCommandRef.current();
+      }, 1200);
+    }
+  }
+
+  askForVoiceCommandRef.current = askForVoiceCommand;
+
+  function startVoiceLoop() {
+    if (!speechSupported()) {
+      setVoiceNote("This browser cannot listen. Use Chrome for Thai and English voice commands.");
+      return;
+    }
+    setVoiceLoop(true);
+    voiceLoopRef.current = true;
+    void askForVoiceCommandRef.current();
+  }
+
+  function endVoiceLoop() {
+    askCycle.current += 1;
+    setVoiceLoop(false);
+    voiceLoopRef.current = false;
+    stopListening();
+    if (typeof window !== "undefined") window.speechSynthesis?.cancel();
+    setVoiceNote("");
+  }
+
+  function changeVoiceLang(next: VoiceLang) {
+    if (next === voiceLang) return;
+    // Stop any active listen/speak cycle before switching language.
+    endVoiceLoop();
+    setVoiceLang(next);
+    voiceLangRef.current = next;
+    setVoiceNote(next === "th-TH" ? "เปลี่ยนเป็นภาษาไทยแล้ว กด Run loop เมื่อพร้อม" : "Switched to English. Press Run loop when ready.");
   }
 
   const mission = state?.mission;
   const robot = state?.robot;
   const active = Boolean(mission?.running || mission?.status === "awaiting_clarification");
   const armed = robot?.execution_mode === "armed";
+
+  useEffect(() => {
+    const running = Boolean(mission?.running);
+    if (running) {
+      wasRunning.current = true;
+      return;
+    }
+    if (!voiceLoopRef.current || !wasRunning.current) return;
+    wasRunning.current = false;
+    if (mission?.status === "awaiting_clarification") return;
+    const timer = window.setTimeout(() => {
+      if (voiceLoopRef.current) void askForVoiceCommandRef.current();
+    }, 900);
+    return () => window.clearTimeout(timer);
+  }, [mission?.running, mission?.status]);
 
   function jog(joint: JointName, delta: number) {
     call("/api/jog", { joint, delta });
@@ -274,7 +417,14 @@ export default function Dashboard() {
           {robot?.serial_connected ? "Serial connected" : "Serial offline"} · {robot?.activity === "moving" ? "Moving" : "Idle"}
         </span>
         <div className="top-spacer" />
-        <button className={mission?.running ? "stop live" : "stop"} onClick={() => call("/api/stop")} disabled={!state}>
+        <button
+          className={mission?.running || voiceLoop ? "stop live" : "stop"}
+          onClick={() => {
+            endVoiceLoop();
+            call("/api/stop");
+          }}
+          disabled={!state}
+        >
           Stop
         </button>
       </header>
@@ -380,7 +530,7 @@ export default function Dashboard() {
         <section className="panel command">
           <header>
             Command
-            <span>Name the object</span>
+            <span>{voiceLoop ? (listening ? "Listening" : "Voice loop") : "Thai / English"}</span>
           </header>
           <div className="body">
             <div className="llm-pick">
@@ -432,6 +582,67 @@ export default function Dashboard() {
               Use this Ollama for planning
             </label>
             {llmNote && <p className="warn">{llmNote}</p>}
+            <div className="voice-bar">
+              <label>
+                Listen in
+                <select
+                  aria-label="Voice language"
+                  value={voiceLang}
+                  disabled={busy}
+                  onChange={(event) => changeVoiceLang(event.target.value as VoiceLang)}
+                >
+                  <option value="th-TH">ไทย Thai</option>
+                  <option value="en-US">English</option>
+                </select>
+              </label>
+              <button
+                type="button"
+                className={listening ? "listening" : ""}
+                disabled={busy || Boolean(mission?.running) || listening}
+                onClick={() => {
+                  if (!speechSupported()) {
+                    setVoiceNote("This browser cannot listen. Use Chrome.");
+                    return;
+                  }
+                  setListening(true);
+                  setVoiceNote(voiceLang === "th-TH" ? "กำลังฟังภาษาไทย..." : "Listening...");
+                  const session = listen(voiceLang, 10000, voiceLang === "th-TH" ? 1000 : 800);
+                  listeningStop.current = session.stop;
+                  session.promise
+                    .then((heard) => {
+                      const text = heard.trim();
+                      if (voiceLooksWrong(voiceLang, text)) {
+                        setVoiceNote(
+                          voiceLang === "th-TH"
+                            ? `ไม่ได้ยินภาษาไทยชัดเจน${text ? ` (ได้ยินว่า: ${text})` : ""}. กด Mic พูดอีกครั้ง`
+                            : "Nothing clear heard.",
+                        );
+                        return;
+                      }
+                      setCommandText(text);
+                      setVoiceNote(text);
+                      void speak(voiceLang === "th-TH" ? `ได้ยินว่า ${text}` : `I heard ${text}`, voiceLang);
+                    })
+                    .catch((error) => setVoiceNote(error instanceof Error ? error.message : "Microphone failed."))
+                    .finally(() => {
+                      listeningStop.current = null;
+                      setListening(false);
+                    });
+                }}
+              >
+                {listening ? "Listening…" : "Mic"}
+              </button>
+              {!voiceLoop ? (
+                <button type="button" className="primary" disabled={busy || active || listening} onClick={startVoiceLoop}>
+                  Run loop
+                </button>
+              ) : (
+                <button type="button" className="stop-loop" disabled={busy} onClick={endVoiceLoop}>
+                  End loop
+                </button>
+              )}
+            </div>
+            {voiceNote && <p className="voice-note">{voiceNote}</p>}
             <form
               onSubmit={(event) => {
                 event.preventDefault();
@@ -443,7 +654,7 @@ export default function Dashboard() {
               <textarea
                 aria-label="Command"
                 value={commandText}
-                placeholder="Name the object and what to do. Example: pick up the green bag and smell it."
+                placeholder="Thai or English. Example: หยิบแก้วใกล้ขวด / pick the glass nearest the bottle"
                 disabled={busy || Boolean(mission?.running)}
                 onChange={(event) => setCommandText(event.target.value)}
                 onKeyDown={(event) => {

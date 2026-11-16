@@ -684,26 +684,38 @@ class Vision:
                     break
                 frame = buffer[start : end + 2]
                 buffer = buffer[end + 2 :]
+                note = ""
+                if _frame_is_black(frame):
+                    # Continuity Camera often sends black frames between good ones.
+                    # Keep the last good picture so the dashboard does not go black
+                    # while detection still uses the previous usable frame.
+                    self._black_frames = getattr(self, "_black_frames", 0) + 1
+                    with self._lock:
+                        has_picture = bool(self._hardware_jpeg) and not _frame_is_black(self._hardware_jpeg)
+                        if self._black_frames >= 12 and not has_picture:
+                            note = _iphone_black_reason(self.camera_label)
+                            self.video_error = note
+                            self.camera_status = ""
+                        elif has_picture:
+                            self.video_error = ""
+                            self.camera_status = "Holding the last clear frame while the camera blinks."
+                    if note and note != previous_note:
+                        previous_note = note
+                        self.on_change()
+                    continue
+                self._black_frames = 0
                 try:
                     preview = self._decorate(frame)
                 except Exception:
                     preview = frame
-                note = ""
-                if _frame_is_black(frame):
-                    self._black_frames = getattr(self, "_black_frames", 0) + 1
-                    if self._black_frames >= 8:
-                        note = _iphone_black_reason(self.camera_label)
-                else:
-                    self._black_frames = 0
                 with self._lock:
                     self._hardware_jpeg = frame
                     self._jpeg = preview
                     self.frame_ts = time.time()
-                    self.video_error = note
+                    self.video_error = ""
                     self.camera_status = ""
-                if not announced or (note and note != previous_note):
+                if not announced:
                     announced = True
-                    previous_note = note
                     self.on_change()
         if self._proc is proc:
             time.sleep(0.2)
@@ -789,6 +801,13 @@ class Vision:
                 return
             if found is not None:
                 self._apply_detections(found)
+                try:
+                    preview = self._decorate(frame)
+                except Exception:
+                    preview = frame
+                with self._lock:
+                    self._jpeg = preview
+                    self.frame_ts = time.time()
                 self.on_change()
             elapsed = time.time() - started
             if self._stop.wait(max(0.0, 0.15 - elapsed)):

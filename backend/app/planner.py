@@ -67,6 +67,13 @@ TARGET_RE = re.compile(
 )
 
 STOP_RE = re.compile(r"\s*(stop|e-stop|estop|abort|halt)\s*[.!]?\s*", re.I)
+NO_PICK_RE = re.compile(
+    r"ไม่ต้องหยิบ|ไม่หยิบอะไร|อย่าหยิบ|ไม่ต้องทำอะไร|ไม่ต้องทำ|ไม่เอา(?:อะไร)?|"
+    r"ยกเลิก|พอแล้ว|ไม่เป็นไร|"
+    r"don'?t\s+pick|do\s+not\s+pick|pick\s+nothing|don'?t\s+(?:do|grab|grasp)\s+anything|"
+    r"never\s+mind|no\s+thanks|cancel(?:\s+that)?",
+    re.I,
+)
 
 
 @dataclass
@@ -112,6 +119,8 @@ class Planner:
             )
         if STOP_RE.fullmatch(cleaned):
             return PlanResult(status="stop", summary="Stop.", intent="stop")
+        if NO_PICK_RE.search(cleaned):
+            return self._noop(cleaned)
         for pattern, capability in UNSUPPORTED:
             if re.search(pattern, cleaned, re.I):
                 return PlanResult(
@@ -184,6 +193,20 @@ class Planner:
         result.planner = "selected"
         result.planner_note = f"You selected {item.name} from the camera list."
         return result
+
+    def _noop(self, text: str) -> PlanResult:
+        """Stand by. Do not reuse the last target or ask the model for an object."""
+        thai = bool(re.search(r"[\u0E00-\u0E7F]", text))
+        return PlanResult(
+            status="ready",
+            intent="noop",
+            summary="ได้ครับ จะไม่หยิบอะไร" if thai else "Okay. I will not pick anything.",
+            final_state="Standing by. Nothing is picked up.",
+            steps=[_step("park", "Stay at the rest pose. Do not grasp.")],
+            targets=[],
+            planner="built-in",
+            planner_note="The instruction said not to pick anything.",
+        )
 
     def _survey(self) -> PlanResult:
         steps = [
@@ -286,11 +309,13 @@ class Planner:
         for item in by_id.values():
             box = list(item.bbox or []) + [0, 0, 0, 0]
             u, v, w, h = box[:4]
+            kind = item.kind or item.label
             scene.append(
                 {
                     "id": item.id,
                     "name": item.name,
-                    "kind": item.kind or item.label,
+                    "kind": kind,
+                    "thai": _thai_names(item),
                     "place": _place_label(_across(item, width)),
                     "across": round(_across(item, width), 2),
                     "depth": round(_depth(item, height), 2),
@@ -306,22 +331,38 @@ class Planner:
             "seen": scene,
             "answers": answers,
         }
+        if not by_id:
+            return PlanResult(
+                status="clarification",
+                question="I can't detect any object. Please look again, then ask for something in the camera.",
+                options=[],
+                planner="local-llm",
+                planner_note="The camera has no free object to use.",
+                intent="clarify",
+            )
         system = (
             "Choose the id of the object the user asked to pick. "
+            "The instruction may be English or Thai. Read either language the same way. "
+            "thai lists Thai words for that seen object. Match Thai instructions using thai and kind. "
+            "Thai verbs: หยิบ/จับ/ยก/เอา = pick, ดม/สูด = smell. "
+            "Thai places: ใกล้/ใกล้ที่สุด = nearest by picture center, ไกล/ไกลสุด = farthest by depth, "
+            "ซ้าย/ทางด้านซ้าย = left/smaller across, ขวา/ทางด้านขวา = right/larger across, กลาง = middle. "
+            "ข้าง/ถัดจาก = beside/next to. ของ = a thing/object, not a specific detector name. "
             "The arm already has a fixed sequence of steps. Do not choose tools or steps. "
-            "kind is the detector name. A glass is a cup, or a name containing glass. A bottle is not a glass. "
-            "across is 0 at the left edge and 1 at the right edge. depth is 0 near the bottom and 1 far at the top. "
-            "cx and cy are the picture center of the object. from_left counts the same kind from the left, starting at 1. "
-            "The kind the user says to pick is the object to return. A later object is only a landmark. Do not return the landmark id. "
-            "If they only named a mouse, return a mouse. "
-            "The furthest landmark is the one of that kind with the greatest depth. Nearest is the smallest distance between cx and cy. "
+            "A glass/แก้ว/ถ้วย is a Cup. A bottle/ขวด is a Bottle, never a glass. "
+            "Return the kind the user said to pick. A later object is only a landmark. Do not return the landmark id. "
+            "If ขวด/bottle comes after ข้าง/ใกล้/ถัดจาก/next to/beside/near, that Bottle is only a landmark. "
+            "Example: หยิบแก้วที่ใกล้ขวด means pick a Cup whose cx,cy is closest to the Bottle. Do not pick the Bottle. "
+            "Example: หยิบของที่อยู่ข้างขวดทางด้านขวา means pick the free object with larger across than the Bottle and closest to it. Do not pick the Bottle. "
+            "across is 0 left and 1 right. depth is 0 near the bottom and 1 far at the top. "
+            "If the object they asked for is not in seen, leave id empty and ask again. "
             "Return only one JSON object: "
             '{"id":"an id copied from seen","question":""}. '
-            "If none matches, leave id empty and set question to a short sentence."
+            "When you chose an id, leave question empty. Do not ask which one if your id is already set."
         )
         missed = PlanResult(
             status="clarification",
-            question="The language model did not answer. Plan again.",
+            question="The language model did not answer. Please ask again.",
             options=[{"id": item.id, "label": item.name} for item in by_id.values()],
             planner="local-llm",
             intent="clarify",
@@ -368,7 +409,7 @@ class Planner:
             log.warning("planner reply was not usable: %s", exc)
             missed.planner_note = f"Local LLM was not used ({exc})."
             return missed
-        chosen = _object_from_llm(parsed, by_id)
+        chosen = _object_from_llm(parsed, by_id, text)
         if isinstance(chosen, PlanResult):
             log.info("planner left the choice open: %s", json.dumps(parsed)[:500])
             return chosen
@@ -604,27 +645,159 @@ def _match_token(token: str, items: list[Observation]):
 def _seen_sentence(items: list[Observation]) -> str:
     names = ", ".join(item.name for item in items)
     if not names:
-        return "The camera did not name an object. Look again."
-    return f"I see {names}. The model did not choose one."
+        return "I can't detect any object. Please look again, then ask for something in the camera."
+    return f"I can't detect that object. The camera sees {names}. Please ask for one of these."
 
 
-def _clarify(question: str, items: list[Observation]) -> PlanResult:
+def _thai_names(item: Observation) -> list[str]:
+    kind = (item.kind or item.label or "").strip().lower()
+    name = (item.name or "").lower()
+    words: list[str] = []
+    if kind in {"cup", "wine glass", "glass"} or "cup" in name or "glass" in name:
+        words.extend(["แก้ว", "แก้วน้ำ", "ถ้วย", "ถ้วยน้ำ"])
+    if kind == "bottle" or "bottle" in name:
+        words.extend(["ขวด", "ขวดน้ำ"])
+    if kind == "mouse" or "mouse" in name:
+        words.extend(["เมาส์", "เมาท์"])
+    if "white" in name or "clear" in name:
+        words.append("สีขาว")
+    if "blue" in name:
+        words.append("สีฟ้า")
+    if "gray" in name or "grey" in name:
+        words.append("สีเทา")
+    if "green" in name:
+        words.append("สีเขียว")
+    if "orange" in name:
+        words.append("สีส้ม")
+    if "red" in name:
+        words.append("สีแดง")
+    return words
+
+
+def _kind_blob(item: Observation) -> str:
+    return f"{item.kind} {item.label} {item.name}".lower()
+
+
+def _is_kind(item: Observation, kind: str) -> bool:
+    blob = _kind_blob(item)
+    if kind == "glass":
+        return "bottle" not in blob and ("cup" in blob or "glass" in blob)
+    if kind == "bottle":
+        return "bottle" in blob
+    if kind == "mouse":
+        return "mouse" in blob
+    return kind in blob
+
+
+def _landmark_kind(text: str) -> str | None:
+    """Object named only as a reference (beside / near / next to), not the pick target."""
+    low = text.lower()
+    patterns = [
+        (r"(?:ข้าง|ใกล้|ถัดจาก|ข้างๆ)\s*ขวด|(?:next to|beside|near|closest to|right of|left of)\s+(?:the\s+)?bottles?", "bottle"),
+        (r"(?:ข้าง|ใกล้|ถัดจาก|ข้างๆ)\s*(?:แก้ว|ถ้วย)|(?:next to|beside|near|closest to|right of|left of)\s+(?:the\s+)?(?:glass|cup)", "glass"),
+        (r"(?:ข้าง|ใกล้|ถัดจาก|ข้างๆ)\s*เมาส์|(?:next to|beside|near|closest to|right of|left of)\s+(?:the\s+)?mouse", "mouse"),
+    ]
+    for pattern, kind in patterns:
+        if re.search(pattern, low):
+            return kind
+    return None
+
+
+def _side_from_text(text: str) -> str | None:
+    low = text.lower()
+    if re.search(r"ทางด้านขวา|ด้านขวา|ทางขวา|ขวามือ|\bon the right\b|\bto the right\b|\bright side\b|\bright of\b", low):
+        return "right"
+    if re.search(r"ทางด้านซ้าย|ด้านซ้าย|ทางซ้าย|ซ้ายมือ|\bon the left\b|\bto the left\b|\bleft side\b|\bleft of\b", low):
+        return "left"
+    return None
+
+
+def _center(item: Observation) -> tuple[float, float]:
+    box = list(item.bbox or []) + [0, 0, 0, 0]
+    u, v, w, h = [float(value) for value in box[:4]]
+    return u + w / 2, v + h / 2
+
+
+def _beside_landmark(text: str, items: list[Observation]) -> Observation | None:
+    """Pick the free object beside a landmark on the named side."""
+    landmark_kind = _landmark_kind(text)
+    if not landmark_kind:
+        return None
+    if not re.search(r"ข้าง|ถัดจาก|ข้างๆ|\bbeside\b|\bnext to\b|\bnear\b", text.lower()):
+        return None
+    free = [item for item in items if not item.held]
+    landmarks = [item for item in free if _is_kind(item, landmark_kind)]
+    if not landmarks:
+        return None
+    # Prefer the landmark nearest the image center when several share the kind.
+    landmark = min(landmarks, key=lambda item: abs(_center(item)[0] - 320))
+    lx, ly = _center(landmark)
+    side = _side_from_text(text)
+    candidates = [item for item in free if item.id != landmark.id and not _is_kind(item, landmark_kind)]
+    # Skip huge background detections like sinks when a normal object is available.
+    graspable = [item for item in candidates if (item.kind or item.label or "").lower() not in {"sink", "dining table", "table"}]
+    if graspable:
+        candidates = graspable
+    if side == "right":
+        candidates = [item for item in candidates if _center(item)[0] >= lx]
+    elif side == "left":
+        candidates = [item for item in candidates if _center(item)[0] <= lx]
+    if not candidates:
+        return None
+    return min(candidates, key=lambda item: (_center(item)[0] - lx) ** 2 + (_center(item)[1] - ly) ** 2)
+
+
+def _requested_pool(text: str, items: list[Observation]) -> list[Observation] | None:
+    """If the command clearly names a kind, keep only those detections."""
+    low = text.lower()
+    free = [item for item in items if not item.held]
+    landmark = _landmark_kind(text)
+    beside = _beside_landmark(text, items)
+    if beside is not None:
+        # Beside + side phrases name a landmark, not the pick target.
+        pool = [item for item in free if not (landmark and _is_kind(item, landmark))]
+        graspable = [item for item in pool if (item.kind or item.label or "").lower() not in {"sink", "dining table", "table"}]
+        return graspable or pool or None
+    if re.search(r"\bglass(?:es)?\b|\bcups?\b|แก้ว|ถ้วย", low) and landmark != "glass":
+        glasses = [item for item in free if _is_kind(item, "glass")]
+        return glasses or None
+    if re.search(r"\bbottles?\b|ขวด", low) and landmark != "bottle":
+        bottles = [item for item in free if _is_kind(item, "bottle")]
+        return bottles or None
+    if re.search(r"\bmice\b|\bmouses?\b|เมาส์|เมาท์", low) and landmark != "mouse":
+        mice = [item for item in free if _is_kind(item, "mouse")]
+        return mice or None
+    return None
+
+
+def _question_is_ambiguous(question: str) -> bool:
+    low = question.lower()
+    return bool(
+        re.search(r"\bwhich\b|\bwhat object\b|more than one|ambiguous", low)
+        or re.search(r"ไหน|ใบไหน|อันไหน|ตัวไหน|ชิ้นไหน", question)
+    )
+
+
+def _clarify(question: str, items: list[Observation], note: str = "") -> PlanResult:
     return PlanResult(
         status="clarification",
         question=question,
         options=[{"id": item.id, "label": item.name} for item in items],
         planner="local-llm",
-        planner_note="The local model did not return a single object to use.",
+        planner_note=note or "Ask again for an object the camera can see.",
         intent="clarify",
     )
 
 
-def _object_from_llm(parsed: dict, by_id: dict) -> Observation | PlanResult:
+def _object_from_llm(parsed: dict, by_id: dict, text: str = "") -> Observation | PlanResult:
     """The model's only job is to name one seen object. Its steps are ignored."""
     decision = _decision(parsed if isinstance(parsed, dict) else {})
     question = decision.get("question")
     question = question.strip() if isinstance(question, str) else ""
     items = list(by_id.values())
+    pool = _requested_pool(text, items)
+    beside = _beside_landmark(text, items)
+    landmark = _landmark_kind(text)
     chosen = []
     ambiguous = False
     for token in _id_tokens(decision):
@@ -634,12 +807,32 @@ def _object_from_llm(parsed: dict, by_id: dict) -> Observation | PlanResult:
         elif match is not None and match not in chosen:
             chosen.append(match)
     if len(chosen) == 1 and not ambiguous:
-        return chosen[0]
+        item = chosen[0]
+        # Never keep a landmark when the words asked for the object beside it.
+        if beside is not None and landmark and _is_kind(item, landmark):
+            return beside
+        if pool is not None and item not in pool:
+            if beside is not None:
+                return beside
+            if len(pool) == 1:
+                return pool[0]
+            names = ", ".join(entry.name for entry in pool)
+            return _clarify(
+                f"Which one do you mean? I see {names}.",
+                pool,
+                "The named kind does not match the model choice.",
+            )
+        if question and _question_is_ambiguous(question):
+            options = pool or [entry for entry in items if (entry.kind or entry.label) == (item.kind or item.label)]
+            if len(options) > 1:
+                return _clarify(question, options, "The model was unsure which object to use.")
+        return item
+    if beside is not None:
+        return beside
     if ambiguous or len(chosen) > 1:
-        return _clarify(question or "Which object do you mean?", items)
-    if question:
-        return _clarify(question, items)
-    return _clarify(_seen_sentence(items), items)
+        options = pool or items
+        return _clarify(question or "Which object do you mean?", options, "More than one object matches. Ask which one.")
+    return _clarify(question or _seen_sentence(items), pool or items)
 
 
 def _extract_targets(text: str) -> list[TargetSpec]:

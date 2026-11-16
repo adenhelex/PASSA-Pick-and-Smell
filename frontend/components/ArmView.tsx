@@ -123,14 +123,15 @@ function tableTwin(item: ObservationItem): { at: V; wide: number; tall: number }
   if (zone) return { at: place(zone.x, zone.y, 0), wide: 42, tall: 70 };
   if (item.bbox.length < 4) return null;
   const [u, v, w, h] = item.bbox;
+  if ((w * h) / (640 * 480) > 0.2) return null;
   const across = clamp((u + w / 2) / 640, 0, 1);
   const depth = 1 - clamp((v + h / 2) / 480, 0, 1);
   const forward = 80 + depth * (TABLE_SIDE_MM - 160);
   const lateral = (across - 0.5) * (TABLE_SIDE_MM - 80);
   return {
     at: place(forward, lateral, 0),
-    wide: clamp((w / 640) * TABLE_SIDE_MM, 40, 220),
-    tall: clamp((h / 480) * 360, 30, 200),
+    wide: clamp((w / 640) * 700, 40, 130),
+    tall: clamp((h / 480) * 300, 30, 180),
   };
 }
 
@@ -148,7 +149,7 @@ interface Scene {
 
 export default function ArmView(props: Omit<Scene, "yaw" | "pitch" | "dragging">) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const scene = useRef<Scene>({ ...props, yaw: Math.PI / 2 + 0.42, pitch: 0.42, dragging: false });
+  const scene = useRef<Scene>({ ...props, yaw: -Math.PI / 2 + 0.38, pitch: 0.5, dragging: false });
   scene.current = { ...scene.current, ...props };
   const kick = useRef<() => void>(() => {});
 
@@ -267,8 +268,8 @@ function paint(
   ctx.clearRect(0, 0, width, height);
 
   const tableSide = TABLE_SIDE_MM * SCALE;
-  const focus: V = [BASE[0] + tableSide / 2, 0.45, BASE[2]];
-  const distance = width < 520 ? 30 : 26;
+  const focus: V = [BASE[0] + tableSide * 0.36, 0.45, BASE[2]];
+  const distance = width < 520 ? 22 : 17;
   const eye = add(focus, [
     Math.sin(scene.yaw) * Math.cos(scene.pitch) * distance,
     Math.sin(scene.pitch) * distance,

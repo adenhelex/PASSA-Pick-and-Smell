@@ -1048,6 +1048,153 @@ def test_the_model_chooses_the_object_the_word_matcher_would_miss(monkeypatch):
     assert [step["tool"] for step in result.steps][-1] == "park"
 
 
+def test_thai_do_not_pick_does_not_reuse_a_target(monkeypatch):
+    called = {"llm": False}
+
+    def _fake_post(*args, **kwargs):
+        called["llm"] = True
+        raise AssertionError("noop commands must not call the model")
+
+    monkeypatch.setattr("httpx.post", _fake_post)
+    from app.planner import Planner
+
+    cup = _seen("cup", "white Cup")
+    cup.kind = "Cup"
+    cup.label = "Cup"
+    cfg = fast_config()
+    cfg.llm_enabled = True
+    result = Planner(cfg).plan("ไม่ต้องหยิบอะไรเลย", [cup], "mock", [])
+    assert result.status == "ready"
+    assert result.intent == "noop"
+    assert result.targets == []
+    assert all(step["tool"] != "grasp" for step in result.steps)
+    assert called["llm"] is False
+
+
+def test_thai_beside_bottle_on_the_right_picks_the_cup(monkeypatch):
+    class _Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            # Model wrongly returns the landmark bottle.
+            return {"message": {"content": '{"id":"bottle","question":""}'}}
+
+    monkeypatch.setattr("httpx.post", lambda *args, **kwargs: _Response())
+    from app.planner import Planner
+
+    bottle = _seen("bottle", "blue Bottle")
+    bottle.kind = "Bottle"
+    bottle.label = "Bottle"
+    bottle.bbox = [247, 300, 56, 108]
+    cup = _seen("cup", "white Cup")
+    cup.kind = "Cup"
+    cup.label = "Cup"
+    cup.bbox = [376, 298, 96, 121]
+    sink = _seen("sink", "white Sink")
+    sink.kind = "Sink"
+    sink.label = "Sink"
+    sink.bbox = [1, 118, 529, 299]
+    cfg = fast_config()
+    cfg.llm_enabled = True
+    result = Planner(cfg).plan("หยิบของที่อยู่ข้างขวดทางด้านขวา", [bottle, cup, sink], "mock", [])
+    assert result.status == "ready"
+    assert result.targets[0]["object_id"] == "cup"
+
+
+def test_thai_glass_does_not_keep_a_bottle(monkeypatch):
+    class _Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"message": {"content": '{"id":"bottle","question":""}'}}
+
+    monkeypatch.setattr("httpx.post", lambda *args, **kwargs: _Response())
+    from app.planner import Planner
+
+    cup = _seen("cup", "white Cup")
+    cup.kind = "Cup"
+    cup.label = "Cup"
+    bottle = _seen("bottle", "blue Bottle")
+    bottle.kind = "Bottle"
+    bottle.label = "Bottle"
+    cfg = fast_config()
+    cfg.llm_enabled = True
+    result = Planner(cfg).plan("หยิบแก้ว", [cup, bottle], "mock", [])
+    assert result.status == "ready"
+    assert result.targets[0]["object_id"] == "cup"
+
+
+def test_an_unsure_model_question_asks_which_object(monkeypatch):
+    class _Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"message": {"content": '{"id":"cup-1","question":"which white Cup?"}'}}
+
+    monkeypatch.setattr("httpx.post", lambda *args, **kwargs: _Response())
+    from app.planner import Planner
+
+    left = _seen("cup-1", "white Cup")
+    left.kind = "Cup"
+    left.label = "Cup"
+    right = _seen("cup-2", "white Cup 2")
+    right.kind = "Cup"
+    right.label = "Cup"
+    cfg = fast_config()
+    cfg.llm_enabled = True
+    result = Planner(cfg).plan("หยิบแก้ว", [left, right], "mock", [])
+    assert result.status == "clarification"
+    assert result.steps == []
+    assert {option["id"] for option in result.options} == {"cup-1", "cup-2"}
+
+
+def test_an_object_the_camera_cannot_see_asks_the_user_again(monkeypatch):
+    class _Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "message": {
+                    "content": (
+                        '{"id":"","question":"I can\'t detect that object. The camera sees white Cup and blue Bottle. '
+                        'Please ask for one of these."}'
+                    )
+                }
+            }
+
+    monkeypatch.setattr("httpx.post", lambda *args, **kwargs: _Response())
+    from app.planner import Planner
+
+    cfg = fast_config()
+    cfg.llm_enabled = True
+    result = Planner(cfg).plan(
+        "pick a banana",
+        [_seen("cup", "white Cup"), _seen("bottle", "blue Bottle")],
+        "mock",
+        [],
+    )
+    assert result.status == "clarification"
+    assert result.steps == []
+    assert "can't detect" in result.question.lower()
+    assert "Cup" in result.question or "Bottle" in result.question
+    assert {option["id"] for option in result.options} == {"cup", "bottle"}
+
+
+def test_an_empty_camera_asks_the_user_to_look_again(monkeypatch):
+    from app.planner import Planner
+
+    cfg = fast_config()
+    cfg.llm_enabled = True
+    result = Planner(cfg).plan("pick a glass", [], "mock", [])
+    assert result.status == "clarification"
+    assert result.steps == []
+    assert "can't detect" in result.question.lower()
+
+
 def test_a_failed_model_does_not_fall_back_to_word_matching(monkeypatch):
     def _boom(*args, **kwargs):
         raise RuntimeError("ollama down")
