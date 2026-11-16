@@ -1,18 +1,20 @@
 """Turn a natural-language instruction into a short tool sequence.
 
-When the local model is on, it is the only thing that chooses which seen
-object to use. The built-in word matcher runs only when the model is off.
-The model still cannot add a tool this arm does not have, and it cannot
-emit joint angles.
+When the local model is on, it only chooses which seen object to use.
+The step list is always the arm's fixed sequence. The built-in word
+matcher runs only when the model is off.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 
 import httpx
+
+log = logging.getLogger(__name__)
 
 from app.config import Config
 from app.ollama import ollama_base
@@ -271,39 +273,55 @@ class Planner:
         )
 
     def _decide(self, text: str, observations: list[Observation], enose_mode: str, answers: list[dict]) -> PlanResult:
-        """The model picks the object and the steps. A failed reply is not replaced by word matching."""
+        """The model only names the object. The step list is the fixed arm sequence."""
         by_id = {}
         for item in observations:
             if item.held:
                 continue
             by_id.setdefault(item.id, item)
-        scene = [
-            {"id": item.id, "name": item.name, "zone": item.zone, "uncertain": item.uncertain}
-            for item in by_id.values()
-        ]
+        width = _image_width(self.cfg)
+        height = _image_height(self.cfg)
+        order = _from_left(list(by_id.values()), width)
+        scene = []
+        for item in by_id.values():
+            box = list(item.bbox or []) + [0, 0, 0, 0]
+            u, v, w, h = box[:4]
+            scene.append(
+                {
+                    "id": item.id,
+                    "name": item.name,
+                    "kind": item.kind or item.label,
+                    "place": _place_label(_across(item, width)),
+                    "across": round(_across(item, width), 2),
+                    "depth": round(_depth(item, height), 2),
+                    "cx": round(float(u) + float(w) / 2),
+                    "cy": round(float(v) + float(h) / 2),
+                    "from_left": order[item.id],
+                    "zone": item.zone,
+                    "uncertain": item.uncertain,
+                }
+            )
         prompt = {
             "instruction": text,
             "seen": scene,
             "answers": answers,
-            "allowed_tools": list(TOOLS),
-            "reply": {
-                "summary": "what you decided",
-                "object_ids": ["an id from seen, or empty"],
-                "steps": [{"tool": "locate", "detail": "why"}],
-                "question": "",
-            },
         }
         system = (
-            "You choose which object in seen the user asked to use, and which tools to run. "
-            "Decide from the user's words and the names in seen. "
-            "Choose only ids from seen. Use only allowed tools, in the order they should run. "
-            "Do not invent joint angles, serial commands, or objects that are not in seen. "
-            "If none of the names is what the user asked for, set object_ids to [] and set question to a short sentence that names what you see. "
-            "If more than one seen object could be the one they mean, set question and leave object_ids empty."
+            "Choose the id of the object the user asked to pick. "
+            "The arm already has a fixed sequence of steps. Do not choose tools or steps. "
+            "kind is the detector name. A glass is a cup, or a name containing glass. A bottle is not a glass. "
+            "across is 0 at the left edge and 1 at the right edge. depth is 0 near the bottom and 1 far at the top. "
+            "cx and cy are the picture center of the object. from_left counts the same kind from the left, starting at 1. "
+            "The kind the user says to pick is the object to return. A later object is only a landmark. Do not return the landmark id. "
+            "If they only named a mouse, return a mouse. "
+            "The furthest landmark is the one of that kind with the greatest depth. Nearest is the smallest distance between cx and cy. "
+            "Return only one JSON object: "
+            '{"id":"an id copied from seen","question":""}. '
+            "If none matches, leave id empty and set question to a short sentence."
         )
         missed = PlanResult(
             status="clarification",
-            question="The language model did not choose an object. Plan again.",
+            question="The language model did not answer. Plan again.",
             options=[{"id": item.id, "label": item.name} for item in by_id.values()],
             planner="local-llm",
             intent="clarify",
@@ -320,13 +338,13 @@ class Planner:
                         "think": False,
                         "format": "json",
                         "keep_alive": "30m",
-                        "options": {"temperature": 0, "num_predict": 500, "num_ctx": 4096},
+                        "options": {"temperature": 0, "num_predict": 512, "num_ctx": 4096},
                         "messages": [
                             {"role": "system", "content": system},
                             {"role": "user", "content": json.dumps(prompt)},
                         ],
                     },
-                    timeout=self.cfg.llm_timeout_s,
+                    timeout=max(self.cfg.llm_timeout_s, 45),
                 )
             else:
                 response = httpx.post(
@@ -339,24 +357,43 @@ class Planner:
                             {"role": "user", "content": json.dumps(prompt)},
                         ],
                     },
-                    timeout=self.cfg.llm_timeout_s,
+                    timeout=max(self.cfg.llm_timeout_s, 45),
                 )
             response.raise_for_status()
             body = response.json()
-            content = body["message"]["content"] if self.cfg.llm_api == "ollama" else body["choices"][0]["message"]["content"]
-            parsed = json.loads(content[content.find("{") : content.rfind("}") + 1])
+            content = _choice_text(body, self.cfg.llm_api)
+            log.info("planner model reply: %s", content[:300])
+            parsed = _choice_json(content)
         except Exception as exc:
+            log.warning("planner reply was not usable: %s", exc)
             missed.planner_note = f"Local LLM was not used ({exc})."
             return missed
-        adopted = _plan_from_llm(parsed, by_id, missed)
-        if adopted.planner != "local-llm":
-            missed.planner_note = adopted.planner_note or missed.question
-            missed.question = missed.planner_note
-            return missed
-        if adopted.status == "ready":
-            adopted.enose_note = _enose_note(adopted, enose_mode)
-            adopted.summary = _with_reach_notes(self.cfg, adopted.targets, adopted.summary)
-        return adopted
+        chosen = _object_from_llm(parsed, by_id)
+        if isinstance(chosen, PlanResult):
+            log.info("planner left the choice open: %s", json.dumps(parsed)[:500])
+            return chosen
+        result = self._fixed_sequence(text, chosen)
+        result.planner = "local-llm"
+        result.planner_note = f"The model chose {chosen.name}. The arm follows its fixed step sequence."
+        result.enose_note = _enose_note(result, enose_mode)
+        return result
+
+    def _fixed_sequence(self, text: str, item: Observation) -> PlanResult:
+        """Pick, smell, and put the object back where the gripper closed."""
+        bound = _bind(TargetSpec(color=None, kind=None, phrase=item.name), item)
+        low = text.lower()
+        wants_pick = bool(re.search(r"\b(pick|grab|grasp|lift)\b", low))
+        wants_smell = bool(re.search(r"\b(smell|sniff|odou?r)\b", low))
+        wants_find = bool(re.search(r"\bfind\b|\bshow me\b|\bwhere\b", low))
+        if wants_find and not (wants_pick or wants_smell):
+            return self._find([bound])
+        return self._manipulate(
+            [bound],
+            smell=True,
+            place=True,
+            destination=None,
+            put_back=True,
+        )
 
     def choose_seen(self, request: str, observations: list[Observation]) -> Observation | None:
         """Ask the model which fresh label is the object the user asked for."""
@@ -383,13 +420,13 @@ class Planner:
                         "think": False,
                         "format": "json",
                         "keep_alive": "30m",
-                        "options": {"temperature": 0, "num_predict": 60, "num_ctx": 2048},
+                        "options": {"temperature": 0, "num_predict": 512, "num_ctx": 2048},
                         "messages": [
                             {"role": "system", "content": system},
                             {"role": "user", "content": user},
                         ],
                     },
-                    timeout=self.cfg.llm_timeout_s,
+                    timeout=max(self.cfg.llm_timeout_s, 45),
                 )
             else:
                 response = httpx.post(
@@ -402,80 +439,207 @@ class Planner:
                             {"role": "user", "content": user},
                         ],
                     },
-                    timeout=self.cfg.llm_timeout_s,
+                    timeout=max(self.cfg.llm_timeout_s, 45),
                 )
             response.raise_for_status()
             body = response.json()
-            content = body["message"]["content"] if self.cfg.llm_api == "ollama" else body["choices"][0]["message"]["content"]
-            parsed = json.loads(content[content.find("{") : content.rfind("}") + 1])
+            parsed = _choice_json(_choice_text(body, self.cfg.llm_api))
         except Exception:
             return None
         chosen = next((item for item in observations if item.id == parsed.get("id")), None)
         return None if chosen is None or chosen.held else chosen
 
 
-def _plan_from_llm(parsed: dict, by_id: dict, fallback: PlanResult) -> PlanResult:
-    question = parsed.get("question")
-    if isinstance(question, str) and question.strip() and not parsed.get("object_ids"):
-        options = [
-            {"id": item.id, "label": item.name}
-            for item in by_id.values()
-        ]
-        if options:
-            return PlanResult(
-                status="clarification",
-                question=question.strip(),
-                options=options,
-                planner="local-llm",
-                planner_note="The local model asked which object you mean.",
-            )
-    steps_in = parsed.get("steps") if isinstance(parsed.get("steps"), list) else []
-    tools = []
-    for step in steps_in:
-        if not isinstance(step, dict):
+def _image_width(cfg: Config) -> float:
+    return float((cfg.calibration or {}).get("image_width") or 640) or 640
+
+
+def _image_height(cfg: Config) -> float:
+    return float((cfg.calibration or {}).get("image_height") or 480) or 480
+
+
+def _across(item: Observation, width: float) -> float:
+    box = list(item.bbox or []) + [0, 0, 0, 0]
+    u, _, w, _ = box[:4]
+    return min(1.0, max(0.0, (float(u) + float(w) / 2) / width))
+
+
+def _place_label(across: float) -> str:
+    if across < 0.4:
+        return "on the left"
+    if across > 0.6:
+        return "on the right"
+    return "in the middle"
+
+
+def _from_left(items: list[Observation], width: float) -> dict[str, int]:
+    groups: dict[str, list[Observation]] = {}
+    for item in items:
+        kind = (item.kind or item.label or item.id).strip().lower()
+        groups.setdefault(kind, []).append(item)
+    labels: dict[str, int] = {}
+    for group in groups.values():
+        ordered = sorted(group, key=lambda item: _across(item, width))
+        for index, item in enumerate(ordered, start=1):
+            labels[item.id] = index
+    return labels
+
+
+def _depth(item: Observation, height: float) -> float:
+    """Higher in the picture is farther. 1 is the top edge and 0 is the bottom."""
+    box = list(item.bbox or []) + [0, 0, 0, 0]
+    _, v, _, h = box[:4]
+    down = (float(v) + float(h) / 2) / height
+    return 1.0 - min(1.0, max(0.0, down))
+
+
+def _choice_text(body: dict, api: str) -> str:
+    """gpt-oss can spend the token budget on thinking and leave content empty."""
+    if api == "ollama":
+        message = body.get("message") or {}
+        content = str(message.get("content") or "")
+        if "{" in content:
+            return content
+        thinking = str(message.get("thinking") or "")
+        if "{" in thinking:
+            return thinking
+        return content
+    message = ((body.get("choices") or [{}])[0].get("message") or {})
+    return str(message.get("content") or "")
+
+
+def _choice_json(text: str) -> dict:
+    """Read one JSON object. A later id object wins when the first one is only the request."""
+    text = text or ""
+    decoder = json.JSONDecoder()
+    first = text.find("{")
+    if first < 0:
+        raise json.JSONDecodeError("no object", text, 0)
+    parsed, _ = decoder.raw_decode(text[first:])
+    if isinstance(parsed, dict) and (
+        _decision_useful(parsed)
+        or any(isinstance(parsed.get(key), dict) for key in ("reply", "response", "plan", "result"))
+    ):
+        return parsed
+    found = list(re.finditer(r"\{\s*\"id\"", text))
+    if found:
+        choice, _ = decoder.raw_decode(text[found[-1].start() :])
+        if isinstance(choice, dict):
+            return choice
+    if isinstance(parsed, dict):
+        return parsed
+    raise json.JSONDecodeError("no object", text, first)
+
+
+def _decision(parsed: dict) -> dict:
+    """The model sometimes echoes the request and hides its choice under reply."""
+    if not isinstance(parsed, dict):
+        return {}
+    nested = None
+    for key in ("reply", "response", "plan", "result"):
+        inner = parsed.get(key)
+        if isinstance(inner, dict):
+            nested = inner
+            break
+    if _decision_useful(parsed):
+        return parsed
+    return nested or parsed
+
+
+def _decision_useful(obj: dict) -> bool:
+    if obj.get("id") or obj.get("object_ids") or obj.get("object_id") or obj.get("objects"):
+        return True
+    question = obj.get("question")
+    return isinstance(question, str) and bool(question.strip())
+
+
+def _id_tokens(decision: dict) -> list[str]:
+    raw = None
+    for key in ("id", "object_ids", "object_id", "objects"):
+        candidate = decision.get(key)
+        if candidate is None or candidate == "" or candidate == []:
             continue
-        tool = step.get("tool")
-        if tool not in TOOLS:
-            fallback.planner_note = (
-                "The local model named a tool this arm does not have. The built-in sequence was kept."
-            )
-            return fallback
-        tools.append(step)
-    if not tools:
-        fallback.planner_note = "The local model did not return a usable step list. The built-in sequence was kept."
-        return fallback
-    chosen = []
-    for object_id in parsed.get("object_ids") or []:
-        item = by_id.get(object_id)
-        if item is not None and item not in chosen:
-            chosen.append(item)
-    targets = [_bind(TargetSpec(color=None, kind=None, phrase=item.name), item) for item in chosen]
-    steps = []
-    for step in tools:
-        target = targets[0] if targets else None
-        needs_object = step["tool"] not in {"scan", "park", "report_scene"}
-        steps.append(
-            _step(
-                step["tool"],
-                str(step.get("detail") or TOOL_LABELS[step["tool"]]).strip(),
-                0 if needs_object and target else None,
-                target if needs_object else None,
-            )
-        )
-    summary = str(parsed.get("summary") or fallback.summary or "The local model chose this sequence.").strip()
-    adopted = PlanResult(
-        status="ready",
-        summary=summary,
-        final_state=summary,
-        steps=steps,
-        targets=targets,
+        raw = candidate
+        break
+    if isinstance(raw, str):
+        raw = [raw]
+    if isinstance(raw, dict):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return []
+    tokens = []
+    for item in raw:
+        if isinstance(item, dict):
+            token = item.get("id") or item.get("object_id") or item.get("name")
+        else:
+            token = item
+        text = str(token or "").strip()
+        if not text or "an id from seen" in text.lower():
+            continue
+        tokens.append(text)
+    return tokens
+
+
+def _match_token(token: str, items: list[Observation]):
+    exact = [item for item in items if item.id == token]
+    if exact:
+        return exact[0]
+    low = token.lower()
+    named = [item for item in items if item.name.lower() == low or item.label.lower() == low]
+    if len(named) == 1:
+        return named[0]
+    if len(named) > 1:
+        return "ambiguous"
+    words = [word for word in re.findall(r"[a-z0-9]+", low) if len(word) > 2]
+    if not words:
+        return None
+    partial = [item for item in items if all(word in item.name.lower() for word in words)]
+    if len(partial) == 1:
+        return partial[0]
+    if len(partial) > 1:
+        return "ambiguous"
+    return None
+
+
+def _seen_sentence(items: list[Observation]) -> str:
+    names = ", ".join(item.name for item in items)
+    if not names:
+        return "The camera did not name an object. Look again."
+    return f"I see {names}. The model did not choose one."
+
+
+def _clarify(question: str, items: list[Observation]) -> PlanResult:
+    return PlanResult(
+        status="clarification",
+        question=question,
+        options=[{"id": item.id, "label": item.name} for item in items],
         planner="local-llm",
-        planner_note="The local model chose the object and the steps from what the camera saw.",
-        intent="manipulate" if any(step["tool"] in {"grasp", "approach", "sample_odor"} for step in steps) else "survey",
+        planner_note="The local model did not return a single object to use.",
+        intent="clarify",
     )
-    if any(step["tool"] == "sample_odor" for step in adopted.steps):
-        adopted.enose_note = fallback.enose_note
-    return adopted
+
+
+def _object_from_llm(parsed: dict, by_id: dict) -> Observation | PlanResult:
+    """The model's only job is to name one seen object. Its steps are ignored."""
+    decision = _decision(parsed if isinstance(parsed, dict) else {})
+    question = decision.get("question")
+    question = question.strip() if isinstance(question, str) else ""
+    items = list(by_id.values())
+    chosen = []
+    ambiguous = False
+    for token in _id_tokens(decision):
+        match = _match_token(token, items)
+        if match == "ambiguous":
+            ambiguous = True
+        elif match is not None and match not in chosen:
+            chosen.append(match)
+    if len(chosen) == 1 and not ambiguous:
+        return chosen[0]
+    if ambiguous or len(chosen) > 1:
+        return _clarify(question or "Which object do you mean?", items)
+    if question:
+        return _clarify(question, items)
+    return _clarify(_seen_sentence(items), items)
 
 
 def _extract_targets(text: str) -> list[TargetSpec]:

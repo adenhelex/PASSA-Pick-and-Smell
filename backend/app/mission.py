@@ -490,6 +490,9 @@ class Mission:
         outcome = self._move(arm, angle, slow=False)
         if outcome != "ok":
             return outcome
+        closed = self.motion.export()["angles"]
+        if all(closed.get(name) is not None for name in ARM_JOINTS):
+            bound["picked_pose"] = {name: float(closed[name]) for name in ARM_JOINTS}
         grasped = self.vision.attempt_grasp(bound["object_id"])
         if not grasped:
             self._log("grasping", "observation", f"The close command finished, but the {bound['name']} may still be on the table.")
@@ -611,6 +614,23 @@ class Mission:
         if bound is None:
             return "skip"
         destination = step.get("destination") or "original"
+        picked = bound.get("picked_pose")
+        if destination == "original" and picked:
+            self._phase("placing")
+            outcome = self._move(picked, bound["close_angle"], slow=False)
+            if outcome != "ok":
+                return outcome
+            outcome = self._move(picked, self.cfg.gripper_open, slow=False)
+            if outcome != "ok":
+                return outcome
+            zone_id = bound.get("zone")
+            track = self.vision.tracks.get(bound["object_id"])
+            if track is not None and zone_id:
+                self.vision.place(bound["object_id"], zone_id)
+            elif track is not None:
+                track.held = False
+            self._log("placing", "observation", f"Put the {bound['name']} back where it was picked up.")
+            return "ok"
         if bound.get("aim") and destination == "original":
             self._phase("placing")
             pose = self._arm_pose(bound, "grasp")

@@ -703,48 +703,46 @@ def test_ollama_llava_request_uses_the_native_chat_api(monkeypatch):
     assert items[0].bbox == [64, 96, 192, 192]
 
 
-def test_the_local_model_can_choose_the_bottle_the_camera_named():
-    from app.planner import PlanResult, _plan_from_llm
-    from app.vision import Observation
+def test_the_local_model_can_choose_the_bottle_the_camera_named(monkeypatch):
+    class _Response:
+        def raise_for_status(self):
+            return None
 
-    item = Observation(
-        id="bottle-1",
-        label="Bottle of water",
-        kind="Bottle of water",
-        color="green",
-        name="green Bottle of water",
-        bbox=[280, 320, 120, 90],
-        confidence=0.9,
-        uncertain=False,
-        attributes=[],
-        table_x=None,
-        table_y=None,
-        zone=None,
-        localizable=False,
-        localization_note="",
-        source="camera",
-        held=False,
-        frame_id="frame",
-    )
-    fallback = PlanResult(status="ready", summary="I don't see a bottle.", enose_note="E-nose is mocked.")
-    adopted = _plan_from_llm(
-        {
-            "summary": "The green bottle of water is the bottle. Pick it up and smell it.",
-            "object_ids": ["bottle-1"],
-            "steps": [
-                {"tool": "locate", "detail": "Use the green bottle of water."},
-                {"tool": "grasp", "detail": "Close on the bottle."},
-                {"tool": "sample_odor", "detail": "Smell it."},
-            ],
-        },
-        {"bottle-1": item},
-        fallback,
-    )
+        def json(self):
+            return {
+                "message": {
+                    "content": (
+                        '{"id":"bottle-1","question":"",'
+                        '"steps":[{"tool":"locate","detail":"Use the green bottle of water."},'
+                        '{"tool":"grasp","detail":"Close on the bottle."}]}'
+                    )
+                }
+            }
+
+    monkeypatch.setattr("httpx.post", lambda *args, **kwargs: _Response())
+    from app.planner import Planner
+
+    cfg = fast_config()
+    cfg.llm_enabled = True
+    item = _seen("bottle-1", "green Bottle of water")
+    adopted = Planner(cfg).plan("Pick up the bottle and smell it.", [item], "mock", [])
     assert adopted.planner == "local-llm"
     assert adopted.targets[0]["object_id"] == "bottle-1"
     assert adopted.targets[0]["seen"] is True
-    assert [step["tool"] for step in adopted.steps] == ["locate", "grasp", "sample_odor"]
-    assert adopted.steps[0]["object_id"] == "bottle-1"
+    assert [step["tool"] for step in adopted.steps] == [
+        "scan",
+        "inspect",
+        "locate",
+        "approach",
+        "grasp",
+        "lift",
+        "inspect",
+        "sample_odor",
+        "place",
+        "park",
+    ]
+    assert adopted.steps[-2]["destination"] == "original"
+    assert adopted.steps[2]["object_id"] == "bottle-1"
 
 
 def _seen(object_id: str, name: str):
@@ -769,6 +767,253 @@ def _seen(object_id: str, name: str):
         held=False,
         frame_id="f",
     )
+
+
+def test_the_user_command_is_sent_with_the_detected_names(monkeypatch):
+    captured = {}
+
+    class _Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "message": {
+                    "content": (
+                        '{"summary":"Pick up the green Bag.","object_ids":["bag-1"],'
+                        '"steps":[{"tool":"grasp","detail":"Close on the green Bag."}],"question":""}'
+                    )
+                }
+            }
+
+    def fake_post(url, json, timeout):
+        captured["body"] = json
+        return _Response()
+
+    monkeypatch.setattr("httpx.post", fake_post)
+    from app.planner import Planner
+
+    cfg = fast_config()
+    cfg.llm_enabled = True
+    Planner(cfg).plan(
+        "pick up the bag",
+        [_seen("bag-1", "green Bag"), _seen("bottle-1", "clear Bottle")],
+        "mock",
+        [],
+    )
+    system = captured["body"]["messages"][0]["content"]
+    user = captured["body"]["messages"][1]["content"]
+    assert "pick up the bag" in user
+    assert "green Bag" in user
+    assert "clear Bottle" in user
+    assert "allowed_tools" not in user
+    assert "fixed sequence" in system
+
+
+def test_an_echoed_reply_that_names_the_bottle_becomes_a_pick(monkeypatch):
+    content = (
+        '{"instruction":"pick a bottle","seen":[],"reply":{'
+        '"summary":"",'
+        '"object_ids":["det-Bottle-1"],'
+        '"steps":[{"tool":"locate","detail":"The bottle is in view."},'
+        '{"tool":"grasp","detail":"Close on the green Bottle."}],'
+        '"question":"Is the green Bottle the one you meant to pick?"}}'
+    )
+
+    class _Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"message": {"content": content}}
+
+    monkeypatch.setattr("httpx.post", lambda *args, **kwargs: _Response())
+    from app.planner import Planner
+
+    cfg = fast_config()
+    cfg.llm_enabled = True
+    result = Planner(cfg).plan(
+        "pick a bottle",
+        [_seen("det-Bottle-1", "green Bottle"), _seen("det-Sink-2", "white Sink")],
+        "mock",
+        [],
+    )
+    assert result.status == "ready"
+    assert result.question == ""
+    assert result.targets[0]["object_id"] == "det-Bottle-1"
+    assert [step["tool"] for step in result.steps] == [
+        "scan",
+        "inspect",
+        "locate",
+        "approach",
+        "grasp",
+        "lift",
+        "inspect",
+        "sample_odor",
+        "place",
+        "park",
+    ]
+    assert result.steps[-2]["destination"] == "original"
+    assert result.summary.startswith("Pick up the green Bottle")
+
+
+def test_the_model_can_name_the_bottle_and_its_steps_are_ignored(monkeypatch):
+    class _Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "message": {
+                    "content": (
+                        '{"summary":"I will pick the green Bottle.","object_ids":["green Bottle"],'
+                        '"steps":[{"tool":"pick","detail":"Pick up the green Bottle."}],"question":""}'
+                    )
+                }
+            }
+
+    monkeypatch.setattr("httpx.post", lambda *args, **kwargs: _Response())
+    from app.planner import Planner
+
+    cfg = fast_config()
+    cfg.llm_enabled = True
+    adopted = Planner(cfg).plan(
+        "pick a bottle",
+        [_seen("det-Bottle-1", "green Bottle"), _seen("det-Sink-2", "white Sink")],
+        "mock",
+        [],
+    )
+    assert adopted.status == "ready"
+    assert adopted.targets[0]["object_id"] == "det-Bottle-1"
+    assert [step["tool"] for step in adopted.steps] == [
+        "scan",
+        "inspect",
+        "locate",
+        "approach",
+        "grasp",
+        "lift",
+        "inspect",
+        "sample_odor",
+        "place",
+        "park",
+    ]
+    assert adopted.steps[-2]["destination"] == "original"
+    assert all(step["detail"] != "Pick up the green Bottle." for step in adopted.steps)
+
+
+def test_the_model_choice_is_kept_when_the_words_name_the_middle(monkeypatch):
+    class _Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"message": {"content": '{"id":"middle-mouse","question":""}'}}
+
+    monkeypatch.setattr("httpx.post", lambda *args, **kwargs: _Response())
+    from app.planner import Planner
+
+    left = _seen("left-mouse", "gray Mouse")
+    left.kind = "Mouse"
+    left.label = "Mouse"
+    left.bbox = [212, 194, 47, 46]
+    middle = _seen("middle-mouse", "gray Mouse 4")
+    middle.kind = "Mouse"
+    middle.label = "Mouse"
+    middle.bbox = [301, 200, 37, 44]
+    cfg = fast_config()
+    cfg.llm_enabled = True
+    result = Planner(cfg).plan(
+        "pick a mouse in the middle of the desk",
+        [left, middle],
+        "mock",
+        [],
+    )
+    assert result.targets[0]["object_id"] == "middle-mouse"
+    assert "The model chose" in result.planner_note
+
+
+def test_a_mouse_without_a_place_stays_the_one_the_model_named(monkeypatch):
+    class _Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"message": {"content": '{"id":"left-mouse","question":""}'}}
+
+    monkeypatch.setattr("httpx.post", lambda *args, **kwargs: _Response())
+    from app.planner import Planner
+
+    left = _seen("left-mouse", "gray Mouse")
+    left.kind = "Mouse"
+    left.label = "Mouse"
+    left.bbox = [212, 194, 47, 46]
+    middle = _seen("middle-mouse", "gray Mouse 4")
+    middle.kind = "Mouse"
+    middle.label = "Mouse"
+    middle.bbox = [301, 200, 37, 44]
+    cfg = fast_config()
+    cfg.llm_enabled = True
+    result = Planner(cfg).plan("pick a mouse", [left, middle], "mock", [])
+    assert result.targets[0]["object_id"] == "left-mouse"
+
+
+def test_furthest_in_the_command_does_not_replace_the_model_choice(monkeypatch):
+    class _Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"message": {"content": '{"id":"right-glass","question":""}'}}
+
+    monkeypatch.setattr("httpx.post", lambda *args, **kwargs: _Response())
+    from app.planner import Planner
+
+    def box(object_id, name, kind, bbox):
+        item = _seen(object_id, name)
+        item.kind = kind
+        item.label = kind
+        item.bbox = bbox
+        return item
+
+    far_mouse = box("far-mouse", "gray Mouse", "Mouse", [180, 40, 40, 30])
+    near_mouse = box("near-mouse", "gray Mouse 4", "Mouse", [220, 300, 40, 30])
+    far_glass = box("far-glass", "white Cup", "Cup", [300, 30, 48, 80])
+    right_glass = box("right-glass", "white Cup 2", "Cup", [420, 180, 50, 90])
+    cfg = fast_config()
+    cfg.llm_enabled = True
+    result = Planner(cfg).plan(
+        "pick a glass on the right of furthest mouse",
+        [far_mouse, near_mouse, far_glass, right_glass],
+        "mock",
+        [],
+    )
+    assert result.targets[0]["object_id"] == "right-glass"
+    assert "The model chose white Cup 2" in result.planner_note
+
+
+def test_an_empty_answer_can_still_be_read_from_the_thinking_text(monkeypatch):
+    class _Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "message": {
+                    "content": "",
+                    "thinking": 'The glass nearest that mouse is white Cup 3. {"id":"cup","question":""}',
+                }
+            }
+
+    monkeypatch.setattr("httpx.post", lambda *args, **kwargs: _Response())
+    from app.planner import Planner
+
+    cup = _seen("cup", "white Cup 3")
+    mouse = _seen("mouse", "gray Mouse")
+    cfg = fast_config()
+    cfg.llm_enabled = True
+    result = Planner(cfg).plan("pick a glass the nearest the furthest mouse", [cup, mouse], "mock", [])
+    assert result.status == "ready"
+    assert result.targets[0]["object_id"] == "cup"
 
 
 def test_the_model_chooses_the_object_the_word_matcher_would_miss(monkeypatch):
@@ -797,7 +1042,10 @@ def test_the_model_chooses_the_object_the_word_matcher_would_miss(monkeypatch):
     result = Planner(cfg).plan("Pick up the glass.", [bottle, cup], "mock", [])
     assert result.planner == "local-llm"
     assert result.targets[0]["object_id"] == "cup-1"
-    assert "glass" not in result.summary.lower() or "clear Cup" in result.summary
+    assert "clear Cup" in result.summary
+    assert [step["tool"] for step in result.steps][0] == "scan"
+    assert "grasp" in [step["tool"] for step in result.steps]
+    assert [step["tool"] for step in result.steps][-1] == "park"
 
 
 def test_a_failed_model_does_not_fall_back_to_word_matching(monkeypatch):

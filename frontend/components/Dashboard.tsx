@@ -53,6 +53,7 @@ export default function Dashboard() {
   const [llmScan, setLlmScan] = useState(0);
   const [llmNote, setLlmNote] = useState("");
   const [notice, setNotice] = useState("");
+  const [commandText, setCommandText] = useState("");
   const uartRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -146,23 +147,44 @@ export default function Dashboard() {
     if (node) node.scrollTop = node.scrollHeight;
   }, [state?.robot.uart]);
 
+  async function post(path: string, body?: unknown) {
+    const response = await fetch(`${BACKEND}${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      setNotice(payload.detail || "The backend refused that action.");
+      return null;
+    }
+    if (payload.robot && payload.mission) setState(payload);
+    if (payload.state) setState(payload.state);
+    return payload;
+  }
+
   async function call(path: string, body?: unknown) {
     setBusy(true);
     setNotice("");
     try {
-      const response = await fetch(`${BACKEND}${path}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: body === undefined ? undefined : JSON.stringify(body),
-      });
-      const payload = await response.json().catch(() => ({}));
-      if (!response.ok) {
-        setNotice(payload.detail || "The backend refused that action.");
-        return payload;
+      return await post(path, body);
+    } catch {
+      setOffline(true);
+      setNotice("The Python backend is not reachable.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function startMission(path: string, body?: unknown) {
+    setBusy(true);
+    setNotice("");
+    try {
+      const payload = await post(path, body);
+      const missionState = payload?.state?.mission ?? payload?.mission;
+      if (missionState?.status === "ready" && missionState.plan && !missionState.running) {
+        await post("/api/run");
       }
-      if (payload.robot && payload.mission) setState(payload);
-      if (payload.state) setState(payload.state);
-      return payload;
     } catch {
       setOffline(true);
       setNotice("The Python backend is not reachable.");
@@ -315,7 +337,7 @@ export default function Dashboard() {
                 if (rect.width < 1 || rect.height < 1) return;
                 const u = ((event.clientX - rect.left) / rect.width) * 640;
                 const v = ((event.clientY - rect.top) / rect.height) * 480;
-                call("/api/select", { u, v });
+                startMission("/api/select", { u, v });
               }}
             >
               <img
@@ -331,7 +353,7 @@ export default function Dashboard() {
                   disabled={busy || Boolean(mission?.running)}
                   onClick={(event) => {
                     event.stopPropagation();
-                    call("/api/select", { object_id: item.id });
+                    startMission("/api/select", { object_id: item.id });
                   }}
                   style={{
                     left: `${(item.bbox[0] / 640) * 100}%`,
@@ -358,7 +380,7 @@ export default function Dashboard() {
         <section className="panel command">
           <header>
             Command
-            <span>Click any object</span>
+            <span>Name the object</span>
           </header>
           <div className="body">
             <div className="llm-pick">
@@ -410,22 +432,35 @@ export default function Dashboard() {
               Use this Ollama for planning
             </label>
             {llmNote && <p className="warn">{llmNote}</p>}
+            <form
+              onSubmit={(event) => {
+                event.preventDefault();
+                const text = commandText.trim();
+                if (!text) return;
+                startMission("/api/command", { text });
+              }}
+            >
+              <textarea
+                aria-label="Command"
+                value={commandText}
+                placeholder="Name the object and what to do. Example: pick up the green bag and smell it."
+                disabled={busy || Boolean(mission?.running)}
+                onChange={(event) => setCommandText(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" && !event.shiftKey) {
+                    event.preventDefault();
+                    event.currentTarget.form?.requestSubmit();
+                  }
+                }}
+              />
+            </form>
             <div className="row">
-              <button disabled={busy || mission?.running} onClick={() => call("/api/look")}>
-                Look
-              </button>
-              <button
-                disabled={busy || mission?.running || !state?.observation.selected_id}
-                onClick={() => call("/api/select", { object_id: state?.observation.selected_id })}
-              >
-                Plan
-              </button>
               <button
                 className="primary"
-                disabled={busy || !mission?.plan || mission.status !== "ready" || mission.running}
-                onClick={() => call("/api/run")}
+                disabled={busy || Boolean(mission?.running) || !commandText.trim()}
+                onClick={() => startMission("/api/command", { text: commandText.trim() })}
               >
-                Run
+                Send
               </button>
               <span className={armed ? "run-mode armed" : "run-mode"}>{armed ? "Armed" : "Dry-run"}</span>
               <button
@@ -451,7 +486,7 @@ export default function Dashboard() {
                   key={item.id}
                   className={item.id === state?.observation.selected_id ? "choice selected" : "choice"}
                   disabled={busy || Boolean(mission?.running)}
-                  onClick={() => call("/api/select", { object_id: item.id })}
+                  onClick={() => startMission("/api/select", { object_id: item.id })}
                 >
                   {item.name}
                   {item.uncertain ? " · uncertain" : ""}
@@ -465,7 +500,7 @@ export default function Dashboard() {
                 <strong>{mission.clarification.question}</strong>
                 <div className="choices">
                   {mission.clarification.options.map((option) => (
-                    <button key={option.id} className="choice" onClick={() => call("/api/clarify", { object_id: option.id })}>
+                    <button key={option.id} className="choice" onClick={() => startMission("/api/clarify", { object_id: option.id })}>
                       {option.label}
                     </button>
                   ))}
