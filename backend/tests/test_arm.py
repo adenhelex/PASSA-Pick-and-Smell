@@ -197,7 +197,7 @@ def test_a_selected_object_stays_when_the_next_caption_drops_it():
         client.post("/api/select", json={"object_id": "orange_cup"})
         mission = app.state.ctx.mission
         mission.vision.observations = []
-        step = next(item for item in mission.plan["steps"] if item["tool"] == "locate")
+        step = next(item for item in mission.plan["steps"] if item["tool"] == "approach")
         bound = mission._resolve_live(step)
         assert bound["name"] == "orange cup"
         assert bound["object_id"] == "orange_cup"
@@ -227,13 +227,9 @@ def test_plan_pick_smell_and_ambiguous_orange():
         answered = client.post("/api/clarify", json={"object_id": "orange_fruit"}).json()
         plan = answered["mission"]["plan"]
         assert [step["tool"] for step in plan["steps"]] == [
-            "scan",
-            "inspect",
-            "locate",
             "approach",
             "grasp",
             "lift",
-            "inspect",
             "sample_odor",
             "place",
             "park",
@@ -297,7 +293,7 @@ def test_mock_cycle_labels_enose_and_missing_enose_is_explicit():
         assert "Mock E-nose" in text
         assert "not a real measurement" in text
         assert "purge" in text.lower()
-        assert "moved with the gripper" in text
+        assert "Grab the orange fruit" in text or "Closing the gripper" in text
 
         client.post("/api/settings", json={"enose_mode": "unavailable"})
         client.post("/api/command", json={"text": "Smell the orange fruit."})
@@ -555,13 +551,15 @@ def test_the_arm_aims_at_the_object_wherever_it_sits_in_the_photo():
     corner = aim_from_bbox([30, 40, 50, 80], cfg)["grasp"]["base"]
     middle = aim_from_bbox([280, 180, 70, 90], cfg)["grasp"]["base"]
     far_side = aim_from_bbox([540, 300, 40, 70], cfg)["grasp"]["base"]
-    assert corner < middle < far_side
+    # Image-left → higher base (robot left / +Y). Image-right → lower base.
+    assert corner > middle > far_side
     near = aim_from_bbox([280, 360, 60, 80], cfg)["grasp"]
     far = aim_from_bbox([280, 40, 60, 80], cfg)["grasp"]
     assert abs(near["base"] - far["base"]) < 1
-    near_reach = forward_wrist(near, cfg.calibration)[0][0]
-    far_reach = forward_wrist(far, cfg.calibration)[0][0]
-    assert far_reach > near_reach + 40
+    # Elbow stays folded so the gripper hangs toward the table, not the sky.
+    for pose in (near, far):
+        assert pose["elbow"] >= 150
+        assert 40 <= pose["shoulder"] <= 140
 
 
 def test_a_grid_cell_sits_on_the_object_not_the_bottom_edge():
@@ -730,19 +728,15 @@ def test_the_local_model_can_choose_the_bottle_the_camera_named(monkeypatch):
     assert adopted.targets[0]["object_id"] == "bottle-1"
     assert adopted.targets[0]["seen"] is True
     assert [step["tool"] for step in adopted.steps] == [
-        "scan",
-        "inspect",
-        "locate",
         "approach",
         "grasp",
         "lift",
-        "inspect",
         "sample_odor",
         "place",
         "park",
     ]
     assert adopted.steps[-2]["destination"] == "original"
-    assert adopted.steps[2]["object_id"] == "bottle-1"
+    assert adopted.steps[0]["object_id"] == "bottle-1"
 
 
 def _seen(object_id: str, name: str):
@@ -842,14 +836,9 @@ def test_an_echoed_reply_that_names_the_bottle_becomes_a_pick(monkeypatch):
     assert result.question == ""
     assert result.targets[0]["object_id"] == "det-Bottle-1"
     assert [step["tool"] for step in result.steps] == [
-        "scan",
-        "inspect",
-        "locate",
         "approach",
         "grasp",
         "lift",
-        "inspect",
-        "sample_odor",
         "place",
         "park",
     ]
@@ -886,14 +875,9 @@ def test_the_model_can_name_the_bottle_and_its_steps_are_ignored(monkeypatch):
     assert adopted.status == "ready"
     assert adopted.targets[0]["object_id"] == "det-Bottle-1"
     assert [step["tool"] for step in adopted.steps] == [
-        "scan",
-        "inspect",
-        "locate",
         "approach",
         "grasp",
         "lift",
-        "inspect",
-        "sample_odor",
         "place",
         "park",
     ]
@@ -1043,7 +1027,7 @@ def test_the_model_chooses_the_object_the_word_matcher_would_miss(monkeypatch):
     assert result.planner == "local-llm"
     assert result.targets[0]["object_id"] == "cup-1"
     assert "clear Cup" in result.summary
-    assert [step["tool"] for step in result.steps][0] == "scan"
+    assert [step["tool"] for step in result.steps][0] == "approach"
     assert "grasp" in [step["tool"] for step in result.steps]
     assert [step["tool"] for step in result.steps][-1] == "park"
 

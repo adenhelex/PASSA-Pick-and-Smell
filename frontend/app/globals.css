@@ -81,7 +81,7 @@ button { cursor: pointer; }
   align-items: start;
 }
 .arm-panel { grid-column: 1 / -1; }
-.arm-view { position: relative; background: #0c100e; }
+.arm-view { position: relative; background: #0c100e; min-height: 420px; }
 .arm-view canvas {
   display: block;
   width: 100%;

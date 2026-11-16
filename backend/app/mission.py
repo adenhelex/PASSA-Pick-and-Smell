@@ -427,6 +427,11 @@ class Mission:
         return "ok"
 
     def _approach(self, step: dict) -> str:
+        # Locate is folded in: bind the live target, then move to it.
+        if self._require_bound(step) is None:
+            outcome = self._locate(step)
+            if outcome != "ok":
+                return outcome
         bound = self._require_bound(step)
         if bound is None:
             return "skip"

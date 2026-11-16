@@ -128,7 +128,7 @@ class Planner:
                     missing_capability=capability,
                     summary=(
                         f"I can't do that. {capability.capitalize()} is not one of the arm's tools. "
-                        "I can scan, inspect, locate, approach, grasp, lift, sample odor, place, and park."
+                        "I can move to an object, grab it, lift, put it down, and rest."
                     ),
                     intent="unsupported",
                 )
@@ -163,16 +163,14 @@ class Planner:
             if clarification is not None:
                 clarification.intent = "clarify"
                 return clarification
-            multi = len(resolved) > 1
-            # The gripper holds one object. A later sample implies putting the earlier one back.
-            place_each = put_back or destination is not None or (multi and (wants_smell or wants_pick))
             if wants_smell or wants_pick:
+                # Always put the object down, then rest. Smell only when the user asked.
                 result = self._manipulate(
                     resolved,
                     smell=wants_smell,
-                    place=place_each,
+                    place=True,
                     destination=destination,
-                    put_back=put_back or (multi and destination is None),
+                    put_back=put_back or destination is None,
                 )
             elif wants_find:
                 result = self._find(resolved)
@@ -188,7 +186,7 @@ class Planner:
     def plan_for_object(self, item: Observation, enose_mode: str) -> PlanResult:
         """The user picked this detection. Do not ask the model to choose another object."""
         bound = _bind(TargetSpec(color=None, kind=None, phrase=item.name), item)
-        result = self._manipulate([bound], smell=True, place=True, destination=None, put_back=True)
+        result = self._manipulate([bound], smell=False, place=True, destination=None, put_back=True)
         result.enose_note = _enose_note(result, enose_mode)
         result.planner = "selected"
         result.planner_note = f"You selected {item.name} from the camera list."
@@ -240,23 +238,13 @@ class Planner:
         )
 
     def _manipulate(self, resolved, smell: bool, place: bool, destination: str | None, put_back: bool) -> PlanResult:
-        steps = [_step("scan", "Start from the rest pose and scan the validated tabletop.")]
+        # Fixed short sequence: move → grab → lift → put down → rest.
+        steps = []
         for index, item in enumerate(resolved):
             name = item["name"]
-            steps.append(_step("inspect", f"Take a fresh frame before acting on the {name}.", index, item))
-            steps.append(_step("locate", f"Confirm the {name} and whether it is inside the pickup area.", index, item))
-            steps.append(_step("approach", f"Approach the {name} with the gripper open.", index, item))
-            steps.append(_step("grasp", f"Close the gripper to the calibrated angle for the {name}.", index, item))
-            steps.append(_step("lift", f"Lift the {name} in short joint steps.", index, item))
-            steps.append(
-                _step(
-                    "inspect",
-                    f"Take a fresh frame and check whether the {name} moved with the gripper.",
-                    index,
-                    item,
-                    purpose="confirm_pickup",
-                )
-            )
+            steps.append(_step("approach", f"Move to the {name} with the gripper open.", index, item))
+            steps.append(_step("grasp", f"Grab the {name}.", index, item))
+            steps.append(_step("lift", f"Lift the {name}.", index, item))
             if smell:
                 steps.append(
                     _step(
@@ -268,20 +256,20 @@ class Planner:
                 )
             if place:
                 if put_back or destination is None:
-                    place_detail = f"Put the {name} back where it started."
+                    place_detail = f"Put the {name} back down."
                     place_dest = "original"
                 else:
                     place_detail = f"Put the {name} on the {destination}."
                     place_dest = destination
                 steps.append(_step("place", place_detail, index, item, destination=place_dest))
-        steps.append(_step("park", "Return to the rest pose."))
+        steps.append(_step("park", "Rest at the park pose."))
         names = _join(item["name"] for item in resolved)
         if smell and place:
-            summary = f"Pick up {names}, sample at the wrist inlet, then put the object back."
+            summary = f"Pick up {names}, sample at the wrist inlet, put it down, then rest."
         elif smell:
             summary = f"Pick up {names} and hold it at the wrist inlet for a sample."
         elif place:
-            summary = f"Pick up {names} and place it."
+            summary = f"Pick up {names}, put it down, then rest."
         else:
             summary = f"Pick up {names}."
         final = _final_state(resolved, smell, place, destination, put_back)
@@ -420,7 +408,7 @@ class Planner:
         return result
 
     def _fixed_sequence(self, text: str, item: Observation) -> PlanResult:
-        """Pick, smell, and put the object back where the gripper closed."""
+        """Move to the object, grab, lift, put down, rest. Smell only if asked."""
         bound = _bind(TargetSpec(color=None, kind=None, phrase=item.name), item)
         low = text.lower()
         wants_pick = bool(re.search(r"\b(pick|grab|grasp|lift)\b", low))
@@ -430,7 +418,7 @@ class Planner:
             return self._find([bound])
         return self._manipulate(
             [bound],
-            smell=True,
+            smell=wants_smell,
             place=True,
             destination=None,
             put_back=True,

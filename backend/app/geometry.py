@@ -148,30 +148,39 @@ def aim_from_bbox(bbox: list[float], cfg: Config) -> dict[str, dict[str, float]]
 
     Left and right in the photo turn the base. Higher in the photo is farther
     from the arm, so the shoulder and elbow reach out. Lower in the photo is
-    nearer, so the arm folds in. The hand stays at about the same height.
+    nearer, so the arm folds in. Tall standing cups are aimed on the mid-body
+    with the wrist hanging down so the gripper can close around the glass.
     """
     u, v, w, h = (list(bbox) + [0, 0, 80, 80])[:4]
     width = float(cfg.calibration.get("image_width") or 640) or 640
     height = float(cfg.calibration.get("image_height") or 480) or 480
     across = min(1.0, max(0.0, (float(u) + float(w) / 2) / width))
-    down = min(1.0, max(0.0, (float(v) + float(h) / 2) / height))
+    # Tall boxes (cups/glasses): aim above the geometric center so the gripper
+    # closes around the body instead of scraping the table at the bbox bottom.
+    tall = float(h) > float(w) * 1.25
+    aim_down = float(v) + float(h) * (0.38 if tall else 0.5)
+    down = min(1.0, max(0.0, aim_down / height))
     depth = 1.0 - down
     base_lo, base_hi = cfg.joint_limits["base"]
-    # A target on the left of the photo uses the low end of the base range.
-    # The opposite sign turned the arm away from the object.
+    # FK: base 90° faces +X, base > 90 turns toward +Y (robot left).
+    # Image left (across → 0) must use the high base end so the arm turns left.
+    # Stay in the Begin fold (elbow near 180, wrist hanging). Only the shoulder
+    # leans forward to the object. Opening the elbow is what points the arm at the sky.
     grasp = {
-        "base": base_lo + across * (base_hi - base_lo),
-        "shoulder": 158 - depth * 58,
-        "elbow": 62 + depth * 30,
-        "wrist_vertical": 85 - depth * 15,
+        "base": base_hi - across * (base_hi - base_lo),
+        "shoulder": 115 - depth * 25,
+        "elbow": 175 - depth * 15,
+        "wrist_vertical": 170,
         "wrist_rotation": 90,
     }
     approach = dict(grasp)
-    approach["shoulder"] = grasp["shoulder"] - 22
-    approach["elbow"] = grasp["elbow"] + 10
+    approach["shoulder"] = max(40.0, grasp["shoulder"] - 12)
+    approach["elbow"] = min(180.0, grasp["elbow"] + 5)
+    approach["wrist_vertical"] = 160
     lift = dict(grasp)
-    lift["shoulder"] = grasp["shoulder"] - 36
-    lift["elbow"] = grasp["elbow"] + 6
+    lift["shoulder"] = max(40.0, grasp["shoulder"] - 18)
+    lift["elbow"] = 180
+    lift["wrist_vertical"] = 165
     return {
         "approach": {joint: _clamp_joint(joint, angle, cfg) for joint, angle in approach.items()},
         "grasp": {joint: _clamp_joint(joint, angle, cfg) for joint, angle in grasp.items()},

@@ -146,8 +146,15 @@ class Vision:
                 return
             index = resolved
         changed = mode != self.mode or (mode == "hardware" and index is not None and index != self.camera_index)
+        # Continuity Camera often sticks on black. Reselecting the same iPhone must
+        # reopen the capture pipe, not skip because the index did not change.
+        force_reopen = mode == "hardware" and (
+            bool(self.video_error)
+            or getattr(self, "_black_frames", 0) >= 8
+            or not self._hardware_jpeg
+        )
         self.cfg.camera_mode = mode
-        if not changed:
+        if not changed and not force_reopen:
             self.camera_label = label
             self.on_change()
             return
@@ -294,11 +301,12 @@ class Vision:
         track = self.tracks.get(object_id)
         if track is None or not self.allow_grasp or track.held:
             return False
-        if not track.spec.localizable or not track.zone:
-            return False
-        zone = self.cfg.zones.get(track.zone)
-        if zone is None or not zone.reachable:
-            return False
+        # Taught-zone picks need a reachable zone. Camera-aim picks have no zone —
+        # still mark them held so lift/place and the twin follow the gripper.
+        if track.zone:
+            zone = self.cfg.zones.get(track.zone)
+            if zone is None or not zone.reachable:
+                return False
         track.held = True
         track.zone = None
         return True
@@ -420,6 +428,8 @@ class Vision:
         self.video_error = ""
         items: list[Observation] = []
         for hit in found:
+            if _ungraspable_detection(hit.label, hit.bbox):
+                continue
             color = _color_name(image, hit.bbox)
             name = f"{color} {hit.label}".strip()
             if any(existing.name.lower() == name.lower() for existing in items):
@@ -699,6 +709,14 @@ class Vision:
                         elif has_picture:
                             self.video_error = ""
                             self.camera_status = "Holding the last clear frame while the camera blinks."
+                    # If Continuity stays black, tear down and reopen the pipe once.
+                    if self._black_frames == 40 and self._proc is proc and "iPhone" in self.camera_label:
+                        threading.Thread(
+                            target=self._reopen_continuity,
+                            args=(proc,),
+                            name="continuity-reopen",
+                            daemon=True,
+                        ).start()
                     if note and note != previous_note:
                         previous_note = note
                         self.on_change()
@@ -749,6 +767,26 @@ class Vision:
         self.camera_status = ""
         self._message_frame(self.video_error)
         self.on_change()
+
+    def _reopen_continuity(self, proc: subprocess.Popen) -> None:
+        """Drop a stuck Continuity pipe and open the iPhone camera again."""
+        if self._proc is not proc or self.mode != "hardware":
+            return
+        label = self.camera_label
+        index = self.camera_index
+        with self._lock:
+            self.camera_status = f"Reopening {label}…"
+            self.video_error = ""
+            self._hardware_jpeg = b""
+        self._message_frame(f"Reopening {label}…")
+        self.on_change()
+        self._close_ffmpeg()
+        time.sleep(0.6)
+        if self.mode != "hardware" or self.camera_index != index:
+            return
+        self._ffmpeg_spec = {"size": "1280x720", "rate": "30", "pixel": "uyvy422"}
+        self._black_frames = 0
+        self._open_ffmpeg(0)
 
     def _drain_ffmpeg(self, proc: subprocess.Popen) -> None:
         if proc.stderr is None:
@@ -1219,6 +1257,39 @@ def _bbox_pixels(raw, width: int, height: int) -> list[int]:
     w = min(max(8.0, w), max(8.0, width - x))
     h = min(max(8.0, h), max(8.0, height - y))
     return [int(round(x)), int(round(y)), int(round(w)), int(round(h))]
+
+
+_BACKGROUND_LABELS = {
+    "sink",
+    "dining table",
+    "table",
+    "bed",
+    "couch",
+    "sofa",
+    "tv",
+    "laptop",
+    "keyboard",
+    "refrigerator",
+    "oven",
+    "toilet",
+    "person",
+    "chair",
+}
+
+
+def _ungraspable_detection(label: str, bbox: list[float] | tuple[float, ...]) -> bool:
+    """Drop background classes and huge boxes the arm cannot pick up."""
+    kind = (label or "").strip().lower()
+    if kind in _BACKGROUND_LABELS:
+        return True
+    box = list(bbox or []) + [0, 0, 0, 0]
+    w, h = float(box[2]), float(box[3])
+    if w <= 0 or h <= 0:
+        return True
+    # Same threshold as the twin: giant scene boxes are furniture, not targets.
+    if (w * h) / (WIDTH * HEIGHT) > 0.2:
+        return True
+    return False
 
 
 def _iphone_black_reason(label: str) -> str:

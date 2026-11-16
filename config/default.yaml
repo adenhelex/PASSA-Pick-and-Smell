@@ -80,11 +80,12 @@ joints:
 # Taught poses. Gripper angle is filled in by the sequencer (open, calibrated close, or hold).
 # Replace these with poses you jog to on the real arm, then run a dry-run before arming.
 poses:
+  # Braccio.Begin() safety rest: lean forward, elbow folded, gripper hanging down.
   park:
     base: 90
-    shoulder: 75
-    elbow: 100
-    wrist_vertical: 90
+    shoulder: 45
+    elbow: 180
+    wrist_vertical: 180
     wrist_rotation: 90
   sample:
     base: 90
