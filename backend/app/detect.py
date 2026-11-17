@@ -13,20 +13,57 @@ from threading import Lock
 import numpy as np
 from PIL import Image
 
-MODEL_PATH = Path(__file__).resolve().parents[1] / "models" / "yolov8n.onnx"
+MODEL_PATH = Path(__file__).resolve().parents[1] / "models" / "yolov8s-worldv2.onnx"
 INPUT_SIZE = 640
 
-# COCO labels, in the order the YOLOv8 nano model emits them.
+# Prompts baked into the YOLO-World ONNX file. Order must match the export.
+# Color is read from the box later, so these names stay generic.
 CLASSES = (
-    "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat", "traffic light",
-    "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep", "cow",
-    "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee",
-    "skis", "snowboard", "sports ball", "kite", "baseball bat", "baseball glove", "skateboard", "surfboard",
-    "tennis racket", "bottle", "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple",
-    "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair", "couch",
-    "potted plant", "bed", "dining table", "toilet", "tv", "laptop", "mouse", "remote", "keyboard",
-    "cell phone", "microwave", "oven", "toaster", "sink", "refrigerator", "book", "clock", "vase",
-    "scissors", "teddy bear", "hair drier", "toothbrush",
+    "person",
+    "bottle",
+    "water bottle",
+    "wine glass",
+    "cup",
+    "mug",
+    "bowl",
+    "jar",
+    "can",
+    "box",
+    "plate",
+    "fork",
+    "knife",
+    "spoon",
+    "banana",
+    "apple",
+    "orange",
+    "mouse",
+    "remote",
+    "cell phone",
+    "book",
+    "pen",
+    "pencil",
+    "marker",
+    "scissors",
+    "keys",
+    "glasses",
+    "watch",
+    "wallet",
+    "card",
+    "tissue",
+    "lid",
+    "cap",
+    "vase",
+    "clock",
+    "toothbrush",
+    "handbag",
+    "backpack",
+    "laptop",
+    "keyboard",
+    "tv",
+    "potted plant",
+    "chair",
+    "couch",
+    "sink",
 )
 
 # The table is the surface under the objects, not something to pick.
@@ -51,7 +88,7 @@ class Detection:
     confidence: float
 
 
-def detect_objects(image: Image.Image, conf: float = 0.28, iou: float = 0.45) -> list[Detection]:
+def detect_objects(image: Image.Image, conf: float = 0.2, iou: float = 0.45) -> list[Detection]:
     session = _model()
     canvas, scale, pad_x, pad_y = _letterbox(image, INPUT_SIZE)
     blob = np.asarray(canvas, dtype=np.float32) / 255.0

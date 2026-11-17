@@ -7,3 +7,6 @@ __pycache__/
 .DS_Store
 .vercel
 out/
+weights/
+runs/
+backend/yolov8s-worldv2.pt
