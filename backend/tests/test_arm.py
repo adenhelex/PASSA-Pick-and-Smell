@@ -1058,14 +1058,13 @@ def test_thai_do_not_pick_does_not_reuse_a_target(monkeypatch):
     assert called["llm"] is False
 
 
-def test_thai_beside_bottle_on_the_right_picks_the_cup(monkeypatch):
+def test_the_model_id_is_kept_for_a_beside_command(monkeypatch):
     class _Response:
         def raise_for_status(self):
             return None
 
         def json(self):
-            # Model wrongly returns the landmark bottle.
-            return {"message": {"content": '{"id":"bottle","question":""}'}}
+            return {"message": {"content": '{"id":"cup","question":""}'}}
 
     monkeypatch.setattr("httpx.post", lambda *args, **kwargs: _Response())
     from app.planner import Planner
@@ -1089,13 +1088,83 @@ def test_thai_beside_bottle_on_the_right_picks_the_cup(monkeypatch):
     assert result.targets[0]["object_id"] == "cup"
 
 
-def test_thai_glass_does_not_keep_a_bottle(monkeypatch):
+def test_the_object_between_two_bottles_is_not_a_bottle(monkeypatch):
     class _Response:
         def raise_for_status(self):
             return None
 
         def json(self):
-            return {"message": {"content": '{"id":"bottle","question":""}'}}
+            return {"message": {"content": '{"id":"mouse","question":""}'}}
+
+    monkeypatch.setattr("httpx.post", lambda *args, **kwargs: _Response())
+    from app.planner import Planner
+
+    purple = _seen("purple", "purple Bottle")
+    purple.kind = "Bottle"
+    purple.label = "Bottle"
+    purple.bbox = [40, 200, 50, 120]
+    gray = _seen("gray", "gray Bottle")
+    gray.kind = "Bottle"
+    gray.label = "Bottle"
+    gray.bbox = [420, 200, 50, 120]
+    mouse = _seen("mouse", "gray Mouse")
+    mouse.kind = "Mouse"
+    mouse.label = "Mouse"
+    mouse.bbox = [220, 240, 70, 50]
+    cfg = fast_config()
+    cfg.llm_enabled = True
+    result = Planner(cfg).plan(
+        "pick the object between Piurple bottle and gray bottle",
+        [purple, mouse, gray],
+        "mock",
+        [],
+    )
+    assert result.status == "ready"
+    assert result.targets[0]["object_id"] == "mouse"
+
+
+def test_the_model_id_is_kept_when_it_names_a_bottle_between_two_bottles(monkeypatch):
+    class _Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"message": {"content": '{"id":"purple","question":""}'}}
+
+    monkeypatch.setattr("httpx.post", lambda *args, **kwargs: _Response())
+    from app.planner import Planner
+
+    purple = _seen("purple", "purple Bottle")
+    purple.kind = "Bottle"
+    purple.label = "Bottle"
+    purple.bbox = [40, 200, 50, 120]
+    gray = _seen("gray", "gray Bottle")
+    gray.kind = "Bottle"
+    gray.label = "Bottle"
+    gray.bbox = [420, 200, 50, 120]
+    mouse = _seen("mouse", "gray Mouse")
+    mouse.kind = "Mouse"
+    mouse.label = "Mouse"
+    mouse.bbox = [220, 240, 70, 50]
+    cfg = fast_config()
+    cfg.llm_enabled = True
+    result = Planner(cfg).plan(
+        "pick the object between the purple bottle and the gray bottle",
+        [purple, mouse, gray],
+        "mock",
+        [],
+    )
+    assert result.status == "ready"
+    assert result.targets[0]["object_id"] == "purple"
+
+
+def test_the_model_id_is_kept_for_a_thai_glass_command(monkeypatch):
+    class _Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"message": {"content": '{"id":"cup","question":""}'}}
 
     monkeypatch.setattr("httpx.post", lambda *args, **kwargs: _Response())
     from app.planner import Planner
@@ -1113,7 +1182,7 @@ def test_thai_glass_does_not_keep_a_bottle(monkeypatch):
     assert result.targets[0]["object_id"] == "cup"
 
 
-def test_an_unsure_model_question_asks_which_object(monkeypatch):
+def test_a_chosen_id_is_used_even_when_the_model_also_asks(monkeypatch):
     class _Response:
         def raise_for_status(self):
             return None
@@ -1133,9 +1202,8 @@ def test_an_unsure_model_question_asks_which_object(monkeypatch):
     cfg = fast_config()
     cfg.llm_enabled = True
     result = Planner(cfg).plan("หยิบแก้ว", [left, right], "mock", [])
-    assert result.status == "clarification"
-    assert result.steps == []
-    assert {option["id"] for option in result.options} == {"cup-1", "cup-2"}
+    assert result.status == "ready"
+    assert result.targets[0]["object_id"] == "cup-1"
 
 
 def test_an_object_the_camera_cannot_see_asks_the_user_again(monkeypatch):
