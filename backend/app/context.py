@@ -11,6 +11,7 @@ from app.enose import ENose
 from app.mission import Mission
 from app.motion import MotionController
 from app.planner import Planner
+from app.store import SampleStore
 from app.vision import Vision
 
 
@@ -21,7 +22,8 @@ class Context:
         self.vision = Vision(cfg)
         self.enose = ENose(cfg)
         self.planner = Planner(cfg)
-        self.mission = Mission(cfg, self.motion, self.vision, self.enose, self.planner)
+        self.store = SampleStore(cfg.database_url)
+        self.mission = Mission(cfg, self.motion, self.vision, self.enose, self.planner, self.store)
         self.motion.on_change = self.publish
         self.vision.on_change = self.publish
         self.mission.on_change = self.publish
@@ -30,6 +32,7 @@ class Context:
         self.latest: dict = {}
 
     def start(self) -> None:
+        self.store.start()
         self.motion.start()
         self.vision.start()
         self.latest = self.snapshot()
@@ -79,6 +82,7 @@ class Context:
             "observation": self.vision.export(),
             "enose": self.enose.export(),
             "mission": self.mission.export(),
+            "samples": self.store.export(),
             "settings": self.settings(),
         }
 

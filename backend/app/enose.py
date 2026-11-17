@@ -13,12 +13,41 @@ import httpx
 from app.config import Config
 
 PATTERNS = {
-    "orange_fruit": [1.22, 0.81, 1.15, 1.48],
-    "orange_cup": [1.05, 0.97, 1.40, 0.92],
-    "blue_cup": [0.88, 1.33, 1.02, 1.11],
-    "green_block": [1.10, 1.10, 0.75, 1.25],
-    "red_block": [0.96, 1.18, 1.07, 0.84],
+    "orange_fruit": [1.22, 0.81, 1.15, 1.48, 0.64, 0.91, 1.33, 0.77],
+    "orange_cup": [1.05, 0.97, 1.40, 0.92, 1.18, 0.73, 0.88, 1.26],
+    "blue_cup": [0.88, 1.33, 1.02, 1.11, 0.79, 1.21, 0.95, 1.08],
+    "green_block": [1.10, 1.10, 0.75, 1.25, 0.98, 0.84, 1.16, 0.91],
+    "red_block": [0.96, 1.18, 1.07, 0.84, 1.29, 0.77, 1.02, 1.14],
 }
+_LABELS = ("R0", "R1", "R2", "R3", "R4", "R5", "R6", "R7")
+
+
+def eight_channels(value) -> list[float] | None:
+    """Pull R0–R7 out of a list or a dict. Missing sensors stay at 0."""
+    nums: list[float] = []
+    if isinstance(value, dict):
+        labeled = []
+        for name in _LABELS:
+            if name in value or name.lower() in value:
+                labeled.append(value.get(name, value.get(name.lower())))
+        if len(labeled) == 8:
+            nums = labeled
+        elif isinstance(value.get("channels"), list):
+            nums = value["channels"]
+        else:
+            return None
+    elif isinstance(value, list):
+        nums = value
+    else:
+        return None
+    out: list[float] = []
+    for item in nums:
+        try:
+            out.append(float(item))
+        except (TypeError, ValueError):
+            out.append(0.0)
+    out = (out + [0.0] * 8)[:8]
+    return [round(item, 4) for item in out]
 
 
 class ENose:
@@ -56,8 +85,8 @@ class ENose:
                 "ok": True,
                 "source": "mock",
                 "stage": "baseline",
-                "channels": [1.0, 1.0, 1.0, 1.0],
-                "detail": "Mock E-nose baseline (not a real measurement): channels held at 1.00.",
+                "channels": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+                "detail": "Mock E-nose baseline (not a real measurement): R0–R7 held at 1.00.",
             }
         return self._hardware("baseline", {})
 
@@ -66,8 +95,8 @@ class ENose:
             return self._unavailable()
         if self.mode == "mock":
             self._wait(cancel)
-            channels = PATTERNS.get(object_id, [1.1, 1.0, 0.9, 1.2])
-            text = ", ".join(f"{value:.2f}" for value in channels)
+            channels = eight_channels(PATTERNS.get(object_id, [1.1, 1.0, 0.9, 1.2, 1.0, 1.0, 1.0, 1.0]))
+            text = ", ".join(f"R{index} {value:.2f}" for index, value in enumerate(channels or []))
             return {
                 "ok": True,
                 "source": "mock",
@@ -124,4 +153,8 @@ class ENose:
         self.connected = True
         self.last_error = ""
         detail = body.get("detail") or f"E-nose {stage} completed."
-        return {"ok": True, "source": "hardware", "stage": stage, "detail": detail, "raw": body}
+        reading = {"ok": True, "source": "hardware", "stage": stage, "detail": detail, "raw": body}
+        channels = eight_channels(body)
+        if channels is not None:
+            reading["channels"] = channels
+        return reading

@@ -182,24 +182,24 @@ text(
     Inches(3.55),
     Inches(5.6),
     Inches(1.4),
-    "A robot arm that sees the table, understands a plain-language request, picks the right object, smells it, and puts it back.",
+    "A robot arm that sees the table, understands a plain-language request, moves to the object, grabs it, lifts, puts it down, and rests.",
     size=19,
     color=MUTED,
 )
 panel(slide, Inches(0.7), Inches(5.35), Inches(11.9), Inches(1.15))
-stat(slide, Inches(1.0), Inches(5.45), Inches(2.6), "10 steps", "fixed, safe pick-smell-return cycle")
+stat(slide, Inches(1.0), Inches(5.45), Inches(2.6), "5 steps", "move, grab, lift, put down, rest")
 stat(slide, Inches(3.9), Inches(5.45), Inches(2.6), "~3 s", "local AI picks the object", BLUE)
 stat(slide, Inches(6.8), Inches(5.45), Inches(2.6), "4–5 / s", "live object detection updates", BLUE)
 stat(slide, Inches(9.7), Inches(5.45), Inches(2.8), "100% local", "no cloud, no data leaves the site", AMBER)
 notes(
     slide,
-    "Open with the one-line idea: you tell the robot what to pick, it finds it, picks it, smells it with the electronic nose, "
-    "and returns it to the exact spot. Everything runs on one Mac on site, with no cloud service.",
+    "Open with the one-line idea: you tell the robot what to pick, it finds it, grabs it, lifts, puts it down, and rests. "
+    "Smell runs only if the operator asks. Everything stays on one Mac on site.",
 )
 
 # 2. What it does
 slide = prs.slides.add_slide(BLANK)
-header(slide, "What it does today", "One sentence in, one complete pick-and-smell cycle out")
+header(slide, "What it does today", "One sentence in, one complete pick cycle out")
 picture(slide, SHOTS / "01-dashboard.png", Inches(0.6), Inches(1.75), Inches(7.6), Inches(5.1))
 bullets(
     slide,
@@ -209,10 +209,10 @@ bullets(
     Inches(5),
     [
         "See | The phone camera finds and labels every object on the table in real time.",
-        "Understand | The operator types a request like “pick the glass nearest the bottle.”",
+        "Understand | Thai or English, such as “pick the glass nearest the bottle.”",
         "Decide | A local AI model chooses which object the sentence means.",
-        "Act | The arm reaches, grips, lifts, samples the smell, and puts it back where it was.",
-        "Show | A live 3D twin and a step log show exactly what the robot is doing.",
+        "Act | Move to it, grab, lift, put it down, then rest. Smell only if asked.",
+        "Show | A live Braccio twin and a five-step log show exactly what the robot is doing.",
     ],
     size=16,
     gap=14,
@@ -284,7 +284,7 @@ notes(
 
 # 5. Act
 slide = prs.slides.add_slide(BLANK)
-header(slide, "Step 3 · Act", "A fixed 10-step cycle: pick, smell, put back")
+header(slide, "Step 3 · Act", "A fixed 5-step cycle: move, grab, lift, put down, rest")
 picture(slide, crop("08-command-result.png", top=0.5, bottom=1.0), Inches(0.6), Inches(1.75), Inches(5.0), Inches(5.1))
 picture(slide, crop("09-mission-timeline.png", top=0.0, bottom=0.36), Inches(5.95), Inches(1.75), Inches(6.8), Inches(3.3))
 bullets(
@@ -294,8 +294,8 @@ bullets(
     Inches(6.8),
     Inches(1.7),
     [
-        "Same steps every time | scan, inspect, locate, approach, grasp, lift, confirm, smell, place, park.",
-        "Returns objects exactly | The arm goes back to the joint angles where it gripped, then opens.",
+        "Same steps every time | move, grab, lift, put down, rest.",
+        "Puts it back down | The arm returns to the pose where it gripped, then opens and rests.",
         "Every action is logged | Time-stamped record for each mission.",
     ],
     size=15,
@@ -304,13 +304,13 @@ bullets(
 footer(slide, 5)
 notes(
     slide,
-    "Left: the 10 fixed steps. Right: the live mission log with phases from scanning to complete. "
-    "The object is always returned to the exact pose where the gripper closed.",
+    "Left: the 5 fixed steps. Right: the live mission log. "
+    "The object is put down at the pose where the gripper closed, then the arm rests in the Begin pose.",
 )
 
 # 6. Digital twin
 slide = prs.slides.add_slide(BLANK)
-header(slide, "Digital twin", "A live 3D copy of the arm and every object on the table")
+header(slide, "Digital twin", "A live Braccio model of the arm and the objects on the table")
 picture(slide, crop("07-twin-reaching.png", top=0.08, left=0.15, right=0.85), Inches(0.6), Inches(1.75), Inches(8.2), Inches(4.3))
 bullets(
     slide,
@@ -319,10 +319,10 @@ bullets(
     Inches(3.7),
     Inches(5),
     [
-        "Mirrors the camera | Objects sit in the same left, right, near, and far positions.",
-        "120 cm table | Matches the real work surface.",
-        "Shape, size, color | Cups, bottles, and mice drawn from what the camera measured.",
-        "Live arm pose | Follows the commanded joint angles while it reaches.",
+        "Mirrors the camera | Left in the picture is left on the table. Right stays right.",
+        "Braccio CAD | The twin uses the real arm meshes, not a generic stick model.",
+        "Rest like the real arm | Park is the Begin pose: folded, gripper hanging, not pointing up.",
+        "Grab stays folded | A pick leans forward to the object. It does not swing at the sky.",
         "Safe rehearsal | Every motion can be watched in dry-run before the arm is powered.",
     ],
     size=15,
@@ -346,7 +346,7 @@ xs = [Inches(0.6), Inches(3.75), Inches(6.9), Inches(10.05)]
 node(slide, xs[0], y1, nw, nh, "iPhone camera", "Live video of the table.", BLUE)
 node(slide, xs[1], y1, nw, nh, "Object detector", "YOLOv8 on the Mac. Boxes, names, colors.", BLUE)
 node(slide, xs[2], y1, nw, nh, "Local AI model", "Reads the request. Returns one object ID.", BLUE)
-node(slide, xs[3], y1, nw, nh, "Mission planner", "Fixed 10-step pick, smell, return.", TEAL)
+node(slide, xs[3], y1, nw, nh, "Mission planner", "Fixed 5 steps: move, grab, lift, put down, rest.", TEAL)
 for a, b in zip(xs[:-1], xs[1:]):
     arrow(slide, a + nw, y1 + nh // 2, b, y1 + nh // 2)
 y2 = Inches(4.15)
@@ -418,9 +418,9 @@ bullets(
     [
         "Live detection on the iPhone camera",
         "Plain-language object choice by a local AI",
-        "Full pick, smell, return cycle in dry-run",
-        "Return to the exact pickup pose",
-        "Live 3D digital twin of arm and table",
+        "Move, grab, lift, put down, and rest in dry-run",
+        "Smell only when the operator asks",
+        "Live Braccio twin that follows the camera left and right",
         "47 automated tests passing",
         "Code on GitHub with version history",
     ],
@@ -436,7 +436,7 @@ bullets(
     Inches(5.5),
     Inches(4.2),
     [
-        "Camera-to-table calibration | Reach is estimated from the image today.",
+        "Camera-to-table calibration | Reach is still estimated from the image.",
         "Real E-nose readings | Smell data is simulated for now.",
         "Powered arm trials | Most runs so far are dry-run.",
         "Grip confirmation | The gripper does not report force.",
@@ -535,7 +535,7 @@ text(
     Inches(3.4),
     Inches(5.8),
     Inches(1.6),
-    "Live demo available: type a request and watch the arm and its 3D twin run the full cycle in dry-run.",
+    "Live demo available: type a request and watch the arm and its Braccio twin run move, grab, lift, put down, and rest in dry-run.",
     size=19,
     color=MUTED,
 )

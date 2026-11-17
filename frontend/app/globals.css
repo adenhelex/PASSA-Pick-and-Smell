@@ -311,6 +311,37 @@ button { cursor: pointer; }
 .steps b { font-weight: 600; }
 .steps p { margin: 2px 0 0; color: var(--muted); font-size: 13px; }
 .choices { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+.question input {
+  flex: 1;
+  min-width: 160px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 7px 10px;
+}
+.records { grid-column: 1 / -1; }
+.record-actions { display: flex; align-items: center; gap: 10px; text-transform: none; letter-spacing: 0; }
+.record-actions .tiny { text-transform: none; letter-spacing: 0; font-size: 12px; padding: 4px 10px; }
+.records .body { max-height: 240px; }
+.records ul { list-style: none; margin: 0; padding: 0; }
+.records li {
+  display: grid;
+  gap: 6px;
+  padding: 8px 0;
+  border-top: 1px solid var(--line);
+}
+.records li:first-child { border-top: 0; padding-top: 0; }
+.records li div { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+.records li span { color: var(--amber); }
+.records time { margin-left: auto; color: var(--muted); font-size: 12px; }
+.records p { display: flex; flex-wrap: wrap; gap: 6px 12px; margin: 0; }
+.records em {
+  font-style: normal;
+  color: var(--muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.records em strong { color: var(--text); font-weight: 600; }
 
 .rail { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; }
 .rail span {

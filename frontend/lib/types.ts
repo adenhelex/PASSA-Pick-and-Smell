@@ -60,6 +60,11 @@ export interface ArmState {
     frame_ts: number;
   };
   enose: { mode: string; connected: boolean; detail: string; base_url: string };
+  samples?: {
+    ready: boolean;
+    error: string;
+    items: SmellRecord[];
+  };
   mission: {
     status: string;
     phase: string;
@@ -72,7 +77,11 @@ export interface ArmState {
       enose_note: string;
       steps: PlanStep[];
     };
-    clarification: null | { question: string; options: Array<{ id: string; label: string }> };
+    clarification: null | {
+      question: string;
+      options: Array<{ id: string; label: string }>;
+      expects_text?: boolean;
+    };
     timeline: Array<{ id: number; ts: number; phase: string; level: string; message: string }>;
     record: { request: string; selected: { id: string; name: string } | null; completed: string[] };
     last_stop: null | {
@@ -101,6 +110,17 @@ export interface ArmState {
     enose_base_url: string;
     baud: number;
   };
+}
+
+export interface SmellRecord {
+  id: number;
+  created_at: string;
+  object_name: string;
+  object_id: string;
+  is_container: boolean;
+  contents: string;
+  channels: number[];
+  source: string;
 }
 
 export interface DeviceList {

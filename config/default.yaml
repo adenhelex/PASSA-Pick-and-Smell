@@ -54,6 +54,10 @@ enose:
   base_url: "http://127.0.0.1:8090"
   timeout_s: 4
 
+database:
+  # PostgreSQL. DATABASE_URL overrides this.
+  url: "postgresql://127.0.0.1:5432/passa"
+
 # Validated tabletop, millimetres, origin at the base, +X forward when the base servo reads 90°.
 workspace:
   x_min: 100
@@ -87,11 +91,12 @@ poses:
     elbow: 180
     wrist_vertical: 180
     wrist_rotation: 90
+  # Same fold as park. Opening the elbow points the twin at the sky, so smell is read in place.
   sample:
     base: 90
     shoulder: 50
-    elbow: 120
-    wrist_vertical: 70
+    elbow: 180
+    wrist_vertical: 165
     wrist_rotation: 90
   scan:
     - name: left

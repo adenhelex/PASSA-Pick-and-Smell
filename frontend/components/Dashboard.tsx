@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import ArmView from "./ArmView";
-import { ArmState, BACKEND, DeviceList, JOINTS, JointName } from "../lib/types";
+import { ArmState, BACKEND, DeviceList, JOINTS, JointName, SmellRecord } from "../lib/types";
 import { VoiceLang, hasThai, listen, speak, speechSupported, voiceLooksWrong } from "../lib/voice";
 
 const PHASES = [
@@ -39,6 +39,53 @@ function ollamaBase(value: string) {
   return text.includes(":") ? `http://${text}` : `http://${text}:11434`;
 }
 
+function csvCell(value: string | number | boolean) {
+  const text = String(value ?? "");
+  return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
+function exportSmells(items: SmellRecord[]) {
+  const header = [
+    "id",
+    "created_at",
+    "object_name",
+    "object_id",
+    "is_container",
+    "contents",
+    "R0",
+    "R1",
+    "R2",
+    "R3",
+    "R4",
+    "R5",
+    "R6",
+    "R7",
+    "source",
+  ];
+  const lines = items.map((item) => {
+    const channels = Array.from({ length: 8 }, (_, index) => item.channels[index] ?? 0);
+    return [
+      item.id,
+      item.created_at,
+      item.object_name,
+      item.object_id,
+      item.is_container ? "yes" : "no",
+      item.contents,
+      ...channels,
+      item.source,
+    ]
+      .map(csvCell)
+      .join(",");
+  });
+  const blob = new Blob([[header.join(","), ...lines].join("\n")], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = "passa-smells.csv";
+  link.click();
+  URL.revokeObjectURL(url);
+}
+
 export default function Dashboard() {
   const [state, setState] = useState<ArmState | null>(null);
   const [offline, setOffline] = useState(false);
@@ -55,6 +102,7 @@ export default function Dashboard() {
   const [llmNote, setLlmNote] = useState("");
   const [notice, setNotice] = useState("");
   const [commandText, setCommandText] = useState("");
+  const [inside, setInside] = useState("");
   const [voiceLang, setVoiceLang] = useState<VoiceLang>("th-TH");
   const [voiceLoop, setVoiceLoop] = useState(false);
   const [listening, setListening] = useState(false);
@@ -453,6 +501,47 @@ export default function Dashboard() {
             showDefaultScene={(state?.observation.mode ?? "mock") !== "hardware"}
           />
         </section>
+        <section className="panel records">
+          <header>
+            Saved smells
+            <span className="record-actions">
+              <button
+                type="button"
+                className="tiny"
+                disabled={!state?.samples?.items.length}
+                onClick={() => exportSmells(state?.samples?.items ?? [])}
+              >
+                Export CSV
+              </button>
+              <span>{state?.samples?.ready ? `${state.samples.items.length} saved` : "Database offline"}</span>
+            </span>
+          </header>
+          <div className="body">
+            {!state?.samples && <p className="note">Waiting for the database.</p>}
+            {state?.samples && !state.samples.ready && (
+              <p className="note">{state.samples.error || "PostgreSQL is not connected."}</p>
+            )}
+            {state?.samples?.ready && state.samples.items.length === 0 && <p className="note">Nothing saved yet.</p>}
+            <ul>
+              {state?.samples?.items.map((item) => (
+                <li key={item.id}>
+                  <div>
+                    <b>{item.object_name}</b>
+                    <span>{item.is_container ? item.contents || "Contents unknown" : "Not a container"}</span>
+                    <time>{new Date(item.created_at).toLocaleString([], { hour12: false })}</time>
+                  </div>
+                  <p>
+                    {item.channels.map((value, index) => (
+                      <em key={index}>
+                        R{index} <strong>{value.toFixed(2)}</strong>
+                      </em>
+                    ))}
+                  </p>
+                </li>
+              ))}
+            </ul>
+          </div>
+        </section>
         <section className="panel">
           <header>
             Camera
@@ -709,13 +798,35 @@ export default function Dashboard() {
             {mission?.clarification && (
               <div className="question">
                 <strong>{mission.clarification.question}</strong>
-                <div className="choices">
-                  {mission.clarification.options.map((option) => (
-                    <button key={option.id} className="choice" onClick={() => startMission("/api/clarify", { object_id: option.id })}>
-                      {option.label}
+                {mission.clarification.expects_text ? (
+                  <form
+                    className="row"
+                    onSubmit={(event) => {
+                      event.preventDefault();
+                      const text = inside.trim();
+                      if (!text) return;
+                      setInside("");
+                      void startMission("/api/clarify", { text });
+                    }}
+                  >
+                    <input
+                      value={inside}
+                      onChange={(event) => setInside(event.target.value)}
+                      placeholder="What is inside?"
+                    />
+                    <button className="primary" type="submit">
+                      Save answer
                     </button>
-                  ))}
-                </div>
+                  </form>
+                ) : (
+                  <div className="choices">
+                    {mission.clarification.options.map((option) => (
+                      <button key={option.id} className="choice" onClick={() => startMission("/api/clarify", { object_id: option.id })}>
+                        {option.label}
+                      </button>
+                    ))}
+                  </div>
+                )}
               </div>
             )}
             {mission?.plan && (

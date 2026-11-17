@@ -22,12 +22,13 @@ class MissionError(Exception):
 
 
 class Mission:
-    def __init__(self, cfg: Config, motion: MotionController, vision: Vision, enose: ENose, planner: Planner):
+    def __init__(self, cfg: Config, motion: MotionController, vision: Vision, enose: ENose, planner: Planner, store=None):
         self.cfg = cfg
         self.motion = motion
         self.vision = vision
         self.enose = enose
         self.planner = planner
+        self.store = store
         self._lock = threading.RLock()
         self.picked = False
         self._bound_map: dict = {}
@@ -38,6 +39,9 @@ class Mission:
         self._request = ""
         self._answers: list[dict] = []
         self._pinned = None
+        self._contents: dict[str, str] = {}
+        self._contents_for = ""
+        self._container_ids: set[str] = set()
         self.settings_epoch = 0
         self.status = "idle"
         self.phase = "idle"
@@ -78,6 +82,9 @@ class Mission:
         self._request = text.strip()
         self._answers = []
         self._pinned = None
+        self._contents = {}
+        self._contents_for = ""
+        self._container_ids = set()
         self.vision.capture("plan")
         self._log("planning", "observation", _describe(self.vision.observations))
         return {"kind": "plan", "plan": self._build_plan()}
@@ -91,6 +98,9 @@ class Mission:
         self._request = item.name
         self._answers = []
         self._pinned = item
+        self._contents = {}
+        self._contents_for = ""
+        self._container_ids = set()
         self._log("planning", "observation", _describe(self.vision.observations))
         result = self.planner.plan_for_object(item, self.enose.mode)
         return {"kind": "plan", "plan": self._apply(result)}
@@ -103,7 +113,13 @@ class Mission:
             return {"kind": "plan", "plan": self.export()}
         if self.status != "awaiting_clarification":
             raise MissionError("The planner is not waiting for an answer.")
+        if self._contents_for:
+            self._contents[self._contents_for] = (text or "").strip()
+            self._contents_for = ""
         self._answers.append(answer)
+        if self._pinned is not None:
+            result = self.planner.plan_for_object(self._pinned, self.enose.mode)
+            return {"kind": "plan", "plan": self._apply(result)}
         return {"kind": "plan", "plan": self._build_plan()}
 
     def run(self) -> dict:
@@ -203,29 +219,42 @@ class Mission:
                 self.vision.set_selected(None)
             else:
                 selected = next((item for item in result.targets if item.get("object_id")), None)
-                self.clarification = None
-                self.outcome = ""
-                self.plan = {
-                    "id": uuid.uuid4().hex[:8],
-                    "status": "ready",
-                    "epoch": self.settings_epoch,
-                    "planner": result.planner,
-                    "planner_note": result.planner_note,
-                    "intent": result.intent,
-                    "summary": result.summary,
-                    "final_state": result.final_state,
-                    "enose_note": result.enose_note,
-                    "steps": result.steps,
-                    "targets": result.targets,
-                }
-                self.status = "ready"
-                self.phase = "idle"
-                self.record["selected"] = (
-                    None
-                    if selected is None
-                    else {"id": selected["object_id"], "name": selected["name"]}
-                )
-                self.vision.set_selected(None if selected is None else selected.get("object_id"))
+                if selected and self._ask_contents(selected):
+                    self.status = "awaiting_clarification"
+                    self.phase = "idle"
+                    self.plan = None
+                    self.outcome = ""
+                    self.clarification = {
+                        "question": f"What is inside the {selected['name']}?",
+                        "options": [],
+                        "expects_text": True,
+                    }
+                    self.record["selected"] = {"id": selected["object_id"], "name": selected["name"]}
+                    self.vision.set_selected(selected.get("object_id"))
+                else:
+                    self.clarification = None
+                    self.outcome = ""
+                    self.plan = {
+                        "id": uuid.uuid4().hex[:8],
+                        "status": "ready",
+                        "epoch": self.settings_epoch,
+                        "planner": result.planner,
+                        "planner_note": result.planner_note,
+                        "intent": result.intent,
+                        "summary": result.summary,
+                        "final_state": result.final_state,
+                        "enose_note": result.enose_note,
+                        "steps": result.steps,
+                        "targets": result.targets,
+                    }
+                    self.status = "ready"
+                    self.phase = "idle"
+                    self.record["selected"] = (
+                        None
+                        if selected is None
+                        else {"id": selected["object_id"], "name": selected["name"]}
+                    )
+                    self.vision.set_selected(None if selected is None else selected.get("object_id"))
             self._seq += 1
             message = self.error or (self.clarification or {}).get("question") or (self.plan or {}).get("summary") or ""
             if message:
@@ -584,10 +613,8 @@ class Mission:
         if bound is None:
             return "skip"
         self._phase("sampling")
-        outcome = self._move(self.cfg.sample.angles(), bound["close_angle"], slow=False)
-        if outcome != "ok":
-            return outcome
-        self._log("sampling", "action", f"Holding the {bound['name']} steady near the wrist inlet.")
+        # Stay in the lift fold. The old sample pose opens the elbow and points the arm at the sky.
+        self._log("sampling", "action", f"Holding the {bound['name']} and reading the smell. The arm stays folded.")
         if not self._hold():
             return "stop"
         if self.enose.mode == "unavailable":
@@ -607,12 +634,43 @@ class Mission:
                 return "stop"
             level = "observation" if reading.get("ok") else "error"
             self._log("sampling", level, reading["detail"])
+            if stage == "sample" and reading.get("ok"):
+                self._save_smell(bound, reading)
             if not reading.get("ok"):
                 if stage != "purge" and self.enose.mode != "unavailable":
                     purge = self.enose.purge(self._cancel)
                     self._log("sampling", "error" if not purge.get("ok") else "observation", purge["detail"])
                 return "fail" if stage == "purge" else "ok"
         return "ok"
+
+    def _ask_contents(self, selected: dict) -> bool:
+        object_id = str(selected.get("object_id") or "")
+        if not object_id or object_id in self._contents:
+            return False
+        if not self.planner.is_container(str(selected.get("name") or ""), str(selected.get("kind") or "")):
+            return False
+        self._contents_for = object_id
+        self._container_ids.add(object_id)
+        return True
+
+    def _save_smell(self, bound: dict, reading: dict) -> None:
+        if self.store is None:
+            return
+        object_id = str(bound.get("object_id") or "")
+        saved = self.store.save(
+            object_name=str(bound.get("name") or ""),
+            object_id=object_id,
+            is_container=object_id in self._container_ids,
+            contents=self._contents.get(object_id, ""),
+            channels=reading.get("channels") or [],
+            source=str(reading.get("source") or self.enose.mode),
+        )
+        if saved.get("saved"):
+            text = ", ".join(f"R{index} {float(saved.get(f'r{index}') or 0):.2f}" for index in range(8))
+            inside = f" Inside: {saved['contents']}." if saved.get("is_container") else ""
+            self._log("sampling", "observation", f"Saved the smell of the {bound['name']}.{inside} {text}.")
+        else:
+            self._log("sampling", "error", f"Could not save the smell of the {bound['name']}. {saved.get('error') or ''}".strip())
 
     def _place(self, step: dict) -> str:
         bound = self._require_bound(step)

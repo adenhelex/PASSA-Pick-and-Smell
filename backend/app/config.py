@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -105,6 +106,7 @@ class Config:
     enose_mode: str
     enose_base_url: str
     enose_timeout_s: float
+    database_url: str
     x_min: float
     x_max: float
     y_min: float
@@ -205,6 +207,7 @@ class Config:
             enose_mode=nose["mode"],
             enose_base_url=nose["base_url"],
             enose_timeout_s=float(nose["timeout_s"]),
+            database_url=os.environ.get("DATABASE_URL") or str((data.get("database") or {}).get("url") or ""),
             x_min=float(space["x_min"]),
             x_max=float(space["x_max"]),
             y_min=float(space["y_min"]),

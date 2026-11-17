@@ -164,10 +164,10 @@ class Planner:
                 clarification.intent = "clarify"
                 return clarification
             if wants_smell or wants_pick:
-                # Always put the object down, then rest. Smell only when the user asked.
+                # Always put the object down, then rest. Every pick is smelled so R0–R7 can be saved.
                 result = self._manipulate(
                     resolved,
-                    smell=wants_smell,
+                    smell=True,
                     place=True,
                     destination=destination,
                     put_back=put_back or destination is None,
@@ -186,11 +186,70 @@ class Planner:
     def plan_for_object(self, item: Observation, enose_mode: str) -> PlanResult:
         """The user picked this detection. Do not ask the model to choose another object."""
         bound = _bind(TargetSpec(color=None, kind=None, phrase=item.name), item)
-        result = self._manipulate([bound], smell=False, place=True, destination=None, put_back=True)
+        result = self._manipulate([bound], smell=True, place=True, destination=None, put_back=True)
         result.enose_note = _enose_note(result, enose_mode)
         result.planner = "selected"
         result.planner_note = f"You selected {item.name} from the camera list."
         return result
+
+    def is_container(self, name: str, kind: str = "") -> bool:
+        """The model decides whether the object can hold something. A failed call falls back to the name."""
+        if not self.cfg.llm_enabled:
+            return False
+        decided = self._ask_container(name, kind)
+        if decided is not None:
+            return decided
+        text = f"{name} {kind}".lower()
+        words = ("cup", "glass", "bottle", "bowl", "jar", "mug", "box", "container", "แก้ว", "ขวด", "ถ้วย", "กล่อง", "โหล")
+        return any(word in text for word in words)
+
+    def _ask_container(self, name: str, kind: str) -> bool | None:
+        system = (
+            "Decide if this object is a container that can hold something inside, "
+            "such as a cup, glass, bottle, bowl, jar, or box. "
+            'Return JSON {"container": true} or {"container": false}.'
+        )
+        user = json.dumps({"name": name, "kind": kind})
+        base = self.cfg.llm_base_url.rstrip("/")
+        try:
+            if self.cfg.llm_api == "ollama":
+                response = httpx.post(
+                    ollama_base(base) + "/api/chat",
+                    json={
+                        "model": self.cfg.llm_model,
+                        "stream": False,
+                        "think": False,
+                        "format": "json",
+                        "keep_alive": "30m",
+                        "options": {"temperature": 0, "num_predict": 64, "num_ctx": 2048},
+                        "messages": [
+                            {"role": "system", "content": system},
+                            {"role": "user", "content": user},
+                        ],
+                    },
+                    timeout=max(self.cfg.llm_timeout_s, 45),
+                )
+            else:
+                response = httpx.post(
+                    base + "/v1/chat/completions",
+                    json={
+                        "model": self.cfg.llm_model,
+                        "temperature": 0,
+                        "messages": [
+                            {"role": "system", "content": system},
+                            {"role": "user", "content": user},
+                        ],
+                    },
+                    timeout=self.cfg.llm_timeout_s,
+                )
+            response.raise_for_status()
+            parsed = _choice_json(_choice_text(response.json(), self.cfg.llm_api))
+        except Exception as exc:
+            log.warning("container decision was not usable: %s", exc)
+            return None
+        if isinstance(parsed, dict) and "container" in parsed:
+            return bool(parsed["container"])
+        return None
 
     def _noop(self, text: str) -> PlanResult:
         """Stand by. Do not reuse the last target or ask the model for an object."""
@@ -249,7 +308,7 @@ class Planner:
                 steps.append(
                     _step(
                         "sample_odor",
-                        f"Hold the {name} steady at the wrist inlet. Request a baseline, a sample, and a purge.",
+                        f"Read the smell of the {name} without leaving the lift pose.",
                         index,
                         item,
                     )
@@ -408,7 +467,7 @@ class Planner:
         return result
 
     def _fixed_sequence(self, text: str, item: Observation) -> PlanResult:
-        """Move to the object, grab, lift, put down, rest. Smell only if asked."""
+        """Move to the object, grab, lift, smell, put down, rest. A find-only request does not smell."""
         bound = _bind(TargetSpec(color=None, kind=None, phrase=item.name), item)
         low = text.lower()
         wants_pick = bool(re.search(r"\b(pick|grab|grasp|lift)\b", low))
@@ -418,7 +477,7 @@ class Planner:
             return self._find([bound])
         return self._manipulate(
             [bound],
-            smell=wants_smell,
+            smell=True,
             place=True,
             destination=None,
             put_back=True,
@@ -974,10 +1033,11 @@ def _bind(spec: TargetSpec, item: Observation | None) -> dict:
         "object_id": item.id,
         "name": item.name,
         "phrase": spec.phrase,
-        "zone": item.zone,
-        "seen": True,
-        "localizable": item.localizable,
-    }
+            "zone": item.zone,
+            "kind": item.kind or item.label or "",
+            "seen": True,
+            "localizable": item.localizable,
+        }
 
 
 def _step(tool: str, detail: str, index: int | None = None, item: dict | None = None, purpose: str = "", destination: str | None = None) -> dict:

@@ -16,6 +16,7 @@ def fast_config() -> Config:
     cfg.sample_hold_s = 0.01
     cfg.motion_timeout_s = 2
     cfg.llm_enabled = False
+    cfg.database_url = "memory"
     return cfg
 
 
@@ -839,6 +840,7 @@ def test_an_echoed_reply_that_names_the_bottle_becomes_a_pick(monkeypatch):
         "approach",
         "grasp",
         "lift",
+        "sample_odor",
         "place",
         "park",
     ]
@@ -878,6 +880,7 @@ def test_the_model_can_name_the_bottle_and_its_steps_are_ignored(monkeypatch):
         "approach",
         "grasp",
         "lift",
+        "sample_odor",
         "place",
         "park",
     ]
@@ -1382,6 +1385,39 @@ def test_camera_list_names_the_device_the_operator_selects(monkeypatch):
         back = client.post("/api/settings", json={"camera_mode": "mock"})
         assert back.json()["observation"]["mode"] == "mock"
         assert back.json()["observation"]["camera_label"] == "Mock tabletop camera"
+
+
+def test_a_container_asks_what_is_inside_and_the_smell_is_saved(monkeypatch):
+    class _Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"message": {"content": '{"container": true}'}}
+
+    monkeypatch.setattr("httpx.post", lambda *args, **kwargs: _Response())
+    cfg = fast_config()
+    cfg.llm_enabled = True
+    with client_for(cfg) as client:
+        client.post("/api/look")
+        asked = client.post("/api/select", json={"object_id": "orange_cup"}).json()
+        mission = asked["state"]["mission"]
+        assert mission["status"] == "awaiting_clarification"
+        assert mission["clarification"]["expects_text"] is True
+        assert "orange cup" in mission["clarification"]["question"]
+        assert mission["plan"] is None
+        answered = client.post("/api/clarify", json={"text": "orange juice"}).json()
+        assert answered["mission"]["status"] == "ready"
+        assert answered["mission"]["plan"]["targets"][0]["object_id"] == "orange_cup"
+        client.post("/api/run")
+        done = wait_mission(client)
+        saved = done["samples"]["items"]
+        assert saved
+        assert saved[0]["object_name"] == "orange cup"
+        assert saved[0]["is_container"] is True
+        assert saved[0]["contents"] == "orange juice"
+        assert len(saved[0]["channels"]) == 8
+        assert any("Saved the smell" in item["message"] for item in done["mission"]["timeline"])
 
 
 def _commands(client: TestClient) -> list[str]:
