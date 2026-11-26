@@ -164,12 +164,13 @@ def aim_from_bbox(bbox: list[float], cfg: Config) -> dict[str, dict[str, float]]
     width = float(cfg.calibration.get("image_width") or 640) or 640
     height = float(cfg.calibration.get("image_height") or 480) or 480
     across = min(1.0, max(0.0, (float(u) + float(w) / 2) / width))
-    # Tall boxes (cups/glasses): aim above the geometric center so the gripper
-    # closes around the body instead of scraping the table at the bbox bottom.
+    # Distance is where the object stands. The bottom of the box meets the
+    # table; the body of a tall cup is only where the gripper should close.
+    foot_down = min(1.0, max(0.0, (float(v) + float(h)) / height))
+    depth = _table_depth(foot_down)
     tall = float(h) > float(w) * 1.25
     aim_down = float(v) + float(h) * (0.38 if tall else 0.5)
     down = min(1.0, max(0.0, aim_down / height))
-    depth = 1.0 - down
     # Build the normal aim first, then multiply each movement by its scale.
     # A 10° left turn at 1.2× becomes 12°. A 10° lift at 1.2× becomes 12°.
     x_gain = _aim_gain(cfg, "aim_offset_x")
@@ -177,10 +178,13 @@ def aim_from_bbox(bbox: list[float], cfg: Config) -> dict[str, dict[str, float]]
     z_gain = _aim_gain(cfg, "aim_offset_z")
     plain = _plain_aim(across, down, depth, cfg)
     center = _plain_aim(0.5, 0.5, 0.5, cfg)
+    # Far/near is the reach past the closest aim, not the tiny offset from the
+    # middle of the photo. An object near the middle otherwise stays put at any scale.
+    nearest = _plain_aim(0.5, 1.0, 0.0, cfg)
     grasp = {
         "base": center["base"] + (plain["base"] - center["base"]) * y_gain,
-        "shoulder": center["shoulder"] + (plain["shoulder"] - center["shoulder"]) * x_gain,
-        "elbow": center["elbow"] + (plain["elbow"] - center["elbow"]) * x_gain,
+        "shoulder": nearest["shoulder"] + (plain["shoulder"] - nearest["shoulder"]) * x_gain,
+        "elbow": nearest["elbow"] + (plain["elbow"] - nearest["elbow"]) * x_gain,
         "wrist_vertical": center["wrist_vertical"] + (plain["wrist_vertical"] - center["wrist_vertical"]) * z_gain,
         "wrist_rotation": 90,
     }
@@ -199,14 +203,34 @@ def aim_from_bbox(bbox: list[float], cfg: Config) -> dict[str, dict[str, float]]
     )}
 
 
+def _table_depth(down: float) -> float:
+    """How far across the table a row is. 0 is the bottom of the photo, 1 is the top.
+
+    The camera looks down, so range follows 1/tan(pitch). The bottom of the
+    frame is a steep, close ray. The top is a shallow, far ray. A pixel halfway
+    up the photo is closer than halfway across the table.
+    """
+    down = min(1.0, max(0.0, down))
+    near_pitch = math.radians(62.0)
+    far_pitch = math.radians(18.0)
+    pitch = far_pitch + down * (near_pitch - far_pitch)
+    near_ground = 1.0 / math.tan(near_pitch)
+    far_ground = 1.0 / math.tan(far_pitch)
+    ground = 1.0 / math.tan(max(pitch, math.radians(8.0)))
+    span = far_ground - near_ground
+    if span <= 1e-6:
+        return 1.0 - down
+    return min(1.0, max(0.0, (ground - near_ground) / span))
+
+
 def _plain_aim(across: float, down: float, depth: float, cfg: Config) -> dict[str, float]:
     """The aim at 1×. Image left turns to the low base end."""
     base_lo, base_hi = cfg.joint_limits["base"]
     aimed_across = min(1.0, max(0.0, 0.5 + (across - 0.5) * 1.4))
     return {
         "base": base_lo + aimed_across * (base_hi - base_lo),
-        "shoulder": 124 - depth * 22,
-        "elbow": 172 - depth * 18,
+        "shoulder": 128 - depth * 36,
+        "elbow": 176 - depth * 28,
         "wrist_vertical": 170 - (0.5 - down) * 48,
         "wrist_rotation": 90,
     }

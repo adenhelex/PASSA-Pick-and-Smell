@@ -88,7 +88,7 @@ class Detection:
     confidence: float
 
 
-def detect_objects(image: Image.Image, conf: float = 0.2, iou: float = 0.45) -> list[Detection]:
+def detect_objects(image: Image.Image, conf: float = 0.08, iou: float = 0.45) -> list[Detection]:
     session = _model()
     canvas, scale, pad_x, pad_y = _letterbox(image, INPUT_SIZE)
     blob = np.asarray(canvas, dtype=np.float32) / 255.0

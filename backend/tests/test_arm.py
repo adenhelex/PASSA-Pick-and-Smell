@@ -626,16 +626,18 @@ def test_the_arm_aims_at_the_object_wherever_it_sits_in_the_photo():
     nearer = aim_from_bbox(low_right, cfg)["grasp"]
     plain_near = aim_from_bbox(low_right, fast_config())["grasp"]
     assert nearer["base"] > plain_near["base"]
-    assert nearer["shoulder"] > plain_near["shoulder"]
+    assert nearer["shoulder"] < plain_near["shoulder"]
+    assert nearer["shoulder"] > shifted["shoulder"]
     assert nearer["wrist_vertical"] > plain_near["wrist_vertical"]
     cfg.aim_offset_x = cfg.aim_offset_y = cfg.aim_offset_z = 1.2
     sample = [236, 140, 40, 40]
     plain_move = aim_from_bbox(sample, fast_config())
     scaled_move = aim_from_bbox(sample, cfg)
     center = aim_from_bbox([300, 220, 40, 40], fast_config())["grasp"]
-    for joint, gain in (("base", 1.2), ("shoulder", 1.2), ("wrist_vertical", 1.2)):
-        movement = plain_move["grasp"][joint] - center[joint]
-        assert abs((scaled_move["grasp"][joint] - center[joint]) - movement * gain) < 0.05
+    nearest = aim_from_bbox([300, 460, 40, 40], fast_config())["grasp"]
+    for joint, origin in (("base", center), ("wrist_vertical", center), ("shoulder", nearest), ("elbow", nearest)):
+        movement = plain_move["grasp"][joint] - origin[joint]
+        assert abs((scaled_move["grasp"][joint] - origin[joint]) - movement * 1.2) < 0.05
     plain_lift = plain_move["grasp"]["wrist_vertical"] - plain_move["lift"]["wrist_vertical"]
     scaled_lift = scaled_move["grasp"]["wrist_vertical"] - scaled_move["lift"]["wrist_vertical"]
     assert abs(scaled_lift - plain_lift * 1.2) < 0.05
@@ -647,6 +649,14 @@ def test_the_arm_aims_at_the_object_wherever_it_sits_in_the_photo():
     for pose in (near, far):
         assert pose["elbow"] >= 150
         assert 40 <= pose["shoulder"] <= 140
+    # A tall bottle and a short one with the same base stand at the same distance.
+    short = aim_from_bbox([280, 300, 60, 40], cfg)["grasp"]["shoulder"]
+    tall = aim_from_bbox([280, 180, 60, 160], cfg)["grasp"]["shoulder"]
+    assert abs(short - tall) < 1
+    # Halfway up the photo is closer than halfway across the table.
+    middle_row = aim_from_bbox([300, 200, 40, 40], cfg)["grasp"]["shoulder"]
+    halfway = (near["shoulder"] + far["shoulder"]) / 2
+    assert middle_row > halfway
 
 
 def test_a_grid_cell_sits_on_the_object_not_the_bottom_edge():

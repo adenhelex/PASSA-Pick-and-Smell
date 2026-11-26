@@ -578,11 +578,13 @@ def _from_left(items: list[Observation], width: float) -> dict[str, int]:
 
 
 def _depth(item: Observation, height: float) -> float:
-    """Higher in the picture is farther. 1 is the top edge and 0 is the bottom."""
+    """How far the object stands. The base of the box is on the table."""
+    from app.geometry import _table_depth
+
     box = list(item.bbox or []) + [0, 0, 0, 0]
     _, v, _, h = box[:4]
-    down = (float(v) + float(h) / 2) / height
-    return 1.0 - min(1.0, max(0.0, down))
+    foot = (float(v) + float(h)) / (height or 1.0)
+    return _table_depth(foot)
 
 
 def _choice_text(body: dict, api: str) -> str:
