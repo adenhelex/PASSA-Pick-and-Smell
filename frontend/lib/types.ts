@@ -109,6 +109,9 @@ export interface ArmState {
     enose_mode: string;
     enose_base_url: string;
     baud: number;
+    aim_offset_x?: number;
+    aim_offset_y?: number;
+    aim_offset_z?: number;
   };
 }
 

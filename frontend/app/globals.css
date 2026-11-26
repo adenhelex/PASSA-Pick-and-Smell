@@ -286,6 +286,36 @@ button { cursor: pointer; }
   border-radius: 6px;
   padding: 8px;
 }
+.serial-pick { display: grid; gap: 4px; margin-top: 8px; font-size: 12px; color: var(--muted); }
+.serial-pick select {
+  width: 100%;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 6px 8px;
+  color: inherit;
+}
+.offsets { display: grid; gap: 8px; margin-top: 12px; }
+.offset-head { display: flex; justify-content: space-between; align-items: center; font-size: 12px; color: var(--muted); }
+.offset {
+  display: grid;
+  grid-template-columns: 6.6rem 1fr auto;
+  gap: 8px;
+  align-items: center;
+  font-size: 12px;
+  color: var(--muted);
+}
+.offset input[type="range"] { width: 100%; }
+.offset-value { display: flex; align-items: center; gap: 4px; color: var(--text); }
+.offset-value input {
+  width: 5rem;
+  padding: 4px 6px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
 .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 8px; }
 .row button, .choice, .tiny {
   border: 1px solid var(--line);

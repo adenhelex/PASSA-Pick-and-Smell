@@ -68,9 +68,10 @@ def compile_joint_script(
 ) -> list[tuple[str, int]]:
     """Validate the whole single-joint path before any serial command is sent.
 
-    The firmware moves one joint per command. The script raises the shoulder
-    into the clearance band before rotating the base, opens the gripper before
-    a swing, and closes it only after the arm joints have arrived.
+    The firmware moves one joint per command. Before the base yaws, an
+    outstretched shoulder is folded back so the base servo is not swinging a
+    reached arm. The gripper opens before a swing and closes only after the
+    arm joints have arrived.
     """
     if any(name not in current or current[name] is None for name in JOINTS):
         raise MotionRejected("Commanded joint angles are unknown. Sync status before moving.")
@@ -100,13 +101,21 @@ def compile_joint_script(
         commit("gripper", gripper_i)
 
     base_delta = abs(rounded_arm["base"] - pose["base"])
-    if base_delta > 0 and not _shoulder_clears_base(pose["shoulder"], cfg):
+    if base_delta > 0:
         transit = _round_deg(cfg.transit_shoulder)
-        commit("shoulder", transit)
-        if not _shoulder_clears_base(pose["shoulder"], cfg):
-            raise MotionRejected(
-                "The shoulder cannot reach a clearance angle before the base rotates."
-            )
+        target_shoulder = rounded_arm["shoulder"]
+        # Fold to the rest shoulder when that is the destination. Otherwise
+        # stop at the transit angle. Either way the base turns with the arm light.
+        if _shoulder_clears_base(target_shoulder, cfg) and target_shoulder <= transit:
+            pre_shoulder = target_shoulder
+        else:
+            pre_shoulder = transit
+        if not _shoulder_clears_base(pose["shoulder"], cfg) or pose["shoulder"] > pre_shoulder:
+            commit("shoulder", pre_shoulder)
+            if not _shoulder_clears_base(pose["shoulder"], cfg):
+                raise MotionRejected(
+                    "The shoulder cannot reach a clearance angle before the base rotates."
+                )
 
     for joint in ("base", "elbow", "wrist_vertical", "wrist_rotation", "shoulder"):
         commit(joint, rounded_arm[joint])
@@ -161,31 +170,58 @@ def aim_from_bbox(bbox: list[float], cfg: Config) -> dict[str, dict[str, float]]
     aim_down = float(v) + float(h) * (0.38 if tall else 0.5)
     down = min(1.0, max(0.0, aim_down / height))
     depth = 1.0 - down
-    base_lo, base_hi = cfg.joint_limits["base"]
-    # FK: base 90° faces +X, base > 90 turns toward +Y (robot left).
-    # Image left (across → 0) must use the high base end so the arm turns left.
-    # Stay in the Begin fold (elbow near 180, wrist hanging). Only the shoulder
-    # leans forward to the object. Opening the elbow is what points the arm at the sky.
+    # Build the normal aim first, then multiply each movement by its scale.
+    # A 10° left turn at 1.2× becomes 12°. A 10° lift at 1.2× becomes 12°.
+    x_gain = _aim_gain(cfg, "aim_offset_x")
+    y_gain = _aim_gain(cfg, "aim_offset_y")
+    z_gain = _aim_gain(cfg, "aim_offset_z")
+    plain = _plain_aim(across, down, depth, cfg)
+    center = _plain_aim(0.5, 0.5, 0.5, cfg)
     grasp = {
-        "base": base_hi - across * (base_hi - base_lo),
-        "shoulder": 115 - depth * 25,
-        "elbow": 175 - depth * 15,
-        "wrist_vertical": 170,
+        "base": center["base"] + (plain["base"] - center["base"]) * y_gain,
+        "shoulder": center["shoulder"] + (plain["shoulder"] - center["shoulder"]) * x_gain,
+        "elbow": center["elbow"] + (plain["elbow"] - center["elbow"]) * x_gain,
+        "wrist_vertical": center["wrist_vertical"] + (plain["wrist_vertical"] - center["wrist_vertical"]) * z_gain,
         "wrist_rotation": 90,
     }
     approach = dict(grasp)
-    approach["shoulder"] = max(40.0, grasp["shoulder"] - 12)
-    approach["elbow"] = min(180.0, grasp["elbow"] + 5)
-    approach["wrist_vertical"] = 160
+    approach["shoulder"] = max(40.0, grasp["shoulder"] - 12 * x_gain)
+    approach["elbow"] = min(180.0, grasp["elbow"] + 5 * x_gain)
+    approach["wrist_vertical"] = grasp["wrist_vertical"] - 10 * z_gain
     lift = dict(grasp)
-    lift["shoulder"] = max(40.0, grasp["shoulder"] - 18)
+    lift["shoulder"] = max(40.0, grasp["shoulder"] - 18 * z_gain)
     lift["elbow"] = 180
-    lift["wrist_vertical"] = 165
+    lift["wrist_vertical"] = grasp["wrist_vertical"] - 5 * z_gain
+    return {name: _clamp_pose(pose, cfg) for name, pose in (
+        ("approach", approach),
+        ("grasp", grasp),
+        ("lift", lift),
+    )}
+
+
+def _plain_aim(across: float, down: float, depth: float, cfg: Config) -> dict[str, float]:
+    """The aim at 1×. Image left turns to the low base end."""
+    base_lo, base_hi = cfg.joint_limits["base"]
+    aimed_across = min(1.0, max(0.0, 0.5 + (across - 0.5) * 1.4))
     return {
-        "approach": {joint: _clamp_joint(joint, angle, cfg) for joint, angle in approach.items()},
-        "grasp": {joint: _clamp_joint(joint, angle, cfg) for joint, angle in grasp.items()},
-        "lift": {joint: _clamp_joint(joint, angle, cfg) for joint, angle in lift.items()},
+        "base": base_lo + aimed_across * (base_hi - base_lo),
+        "shoulder": 124 - depth * 22,
+        "elbow": 172 - depth * 18,
+        "wrist_vertical": 170 - (0.5 - down) * 48,
+        "wrist_rotation": 90,
     }
+
+
+def _aim_gain(cfg: Config, name: str) -> float:
+    try:
+        gain = float(getattr(cfg, name, 1) or 1)
+    except (TypeError, ValueError):
+        gain = 1.0
+    return max(0.5, min(4.0, gain))
+
+
+def _clamp_pose(pose: dict[str, float], cfg: Config) -> dict[str, float]:
+    return {joint: _clamp_joint(joint, angle, cfg) for joint, angle in pose.items()}
 
 
 def grip_for_bbox(bbox: list[float], cfg: Config) -> float:

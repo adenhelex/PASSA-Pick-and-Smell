@@ -87,7 +87,7 @@ function tableTwin(item: ObservationItem) {
       const across = clamp((u + w / 2) / 640, 0, 1);
       const depth = 1 - clamp((v + h / 2) / 480, 0, 1);
       const forward = WORK_X.min + depth * (WORK_X.max - WORK_X.min);
-      // This mount: image-left (high base) is −Y, image-right is +Y.
+      // Image-left is the low base end and sits on −Y. Image-right sits on +Y.
       const lateral = WORK_Y.min + across * (WORK_Y.max - WORK_Y.min);
       const kind = objectKind(item.name);
       const tallish = kind === "bottle" || h > w * 1.2;
@@ -109,8 +109,8 @@ function rad(deg: number) {
 
 /** ros_braccio_urdf servo mapping — Begin() looks like the reference photo. */
 function applyBraccioPose(parts: ArmParts, angles: Record<JointName, number>) {
-  // 180−base swaps left and right. Base 90 still faces straight onto the table.
-  parts.base.rotation.z = -rad(180 - angles.base);
+  // Base 90 faces straight onto the table. A lower angle turns toward image-left.
+  parts.base.rotation.z = -rad(angles.base);
   parts.shoulder.rotation.x = rad(angles.shoulder);
   parts.elbow.rotation.x = rad(angles.elbow);
   parts.wristPitch.rotation.x = rad(angles.wrist_vertical);
@@ -253,6 +253,32 @@ function makeObjectMesh(item: ObservationItem, wide: number, tall: number) {
   return mesh;
 }
 
+function prepareSafariWebGL() {
+  const prototype = WebGL2RenderingContext.prototype as WebGL2RenderingContext & { __passaWebGL?: boolean };
+  if (prototype.__passaWebGL) return;
+  const readPrecision = prototype.getShaderPrecisionFormat;
+  prototype.getShaderPrecisionFormat = function (shaderType: number, precisionType: number) {
+    const format = readPrecision.call(this, shaderType, precisionType);
+    if (format) return format;
+    const high = precisionType === this.HIGH_FLOAT || precisionType === this.HIGH_INT;
+    return { rangeMin: high ? 127 : 15, rangeMax: high ? 127 : 15, precision: high ? 23 : 10 };
+  };
+  const readParameter = prototype.getParameter;
+  prototype.getParameter = function (pname: number) {
+    const value = readParameter.call(this, pname);
+    if (value != null) return value;
+    if (pname === this.VERSION) return "WebGL 2.0";
+    if (pname === this.SHADING_LANGUAGE_VERSION) return "WebGL GLSL ES 3.00";
+    if (pname === this.VENDOR) return "WebKit";
+    if (pname === this.RENDERER) return "WebKit WebGL";
+    if (pname === this.SCISSOR_BOX || pname === this.VIEWPORT) {
+      return new Int32Array([0, 0, this.canvas.width || 300, this.canvas.height || 150]);
+    }
+    return value;
+  };
+  prototype.__passaWebGL = true;
+}
+
 interface SceneProps {
   angles: Record<JointName, number | null>;
   jointsKnown: boolean;
@@ -275,16 +301,17 @@ export default function ArmView(props: SceneProps) {
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0x101411);
     const camera = new THREE.PerspectiveCamera(42, 1, 0.05, 80);
+    prepareSafariWebGL();
     const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
     renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
-    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.enabled = false;
     host.appendChild(renderer.domElement);
 
     const hemi = new THREE.HemisphereLight(0xdde8df, 0x1a201c, 1.1);
     scene.add(hemi);
     const key = new THREE.DirectionalLight(0xffffff, 1.15);
     key.position.set(-6, 10, 4);
-    key.castShadow = true;
+    key.castShadow = false;
     scene.add(key);
 
     scene.add(makeTable());

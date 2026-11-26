@@ -89,8 +89,10 @@ def create_app(config: Config | None = None) -> FastAPI:
 
     @app.post("/api/settings")
     def update_settings(body: SettingsIn):
-        _require_idle()
         data = body.model_dump(exclude_none=True)
+        offset_only = bool(data) and set(data) <= {"aim_offset_x", "aim_offset_y", "aim_offset_z"}
+        if not offset_only:
+            _require_idle()
         if "serial_mode" in data:
             if data["serial_mode"] not in {"mock", "hardware"}:
                 raise HTTPException(400, "Serial mode must be mock or hardware.")
@@ -127,7 +129,11 @@ def create_app(config: Config | None = None) -> FastAPI:
         if "enose_base_url" in data:
             ctx.enose.base_url = data["enose_base_url"].rstrip("/")
             ctx.cfg.enose_base_url = ctx.enose.base_url
-        ctx.mission.note_settings_changed()
+        for axis, field in (("x", "aim_offset_x"), ("y", "aim_offset_y"), ("z", "aim_offset_z")):
+            if field in data:
+                setattr(ctx.cfg, field, max(0.5, min(4.0, float(data[field]))))
+        if not offset_only:
+            ctx.mission.note_settings_changed()
         ctx.publish()
         return ctx.snapshot()
 
@@ -324,6 +330,9 @@ class SettingsIn(BaseModel):
     vlm_model: str | None = None
     enose_mode: str | None = None
     enose_base_url: str | None = None
+    aim_offset_x: float | None = None
+    aim_offset_y: float | None = None
+    aim_offset_z: float | None = None
 
 
 class GripperIn(BaseModel):

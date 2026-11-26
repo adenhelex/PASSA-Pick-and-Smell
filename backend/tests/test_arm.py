@@ -64,6 +64,20 @@ def test_joint_limits_and_base_clearance():
         )
 
 
+def test_park_folds_the_shoulder_before_returning_the_base():
+    cfg = Config.load()
+    reached = {
+        "base": 108,
+        "shoulder": 98,
+        "elbow": 170,
+        "wrist_vertical": 160,
+        "wrist_rotation": 90,
+        "gripper": 71,
+    }
+    script = compile_joint_script(reached, cfg.park.angles(), cfg.gripper_open, cfg)
+    assert script.index(("shoulder", 45)) < script.index(("base", 90))
+
+
 def test_image_coordinate_without_calibration_is_not_a_pose():
     cfg = Config.load()
     fix = pixel_to_table(320, 240, cfg.park.angles(), cfg)
@@ -134,6 +148,51 @@ def test_stop_acks_and_timeout_is_not_replayed():
         assert ctrl.export()["angles"]["base"] == 90
     finally:
         ctrl.shutdown()
+
+
+def test_status_ignores_a_reset_notice_left_by_stop():
+    cfg = fast_config()
+    cfg.mode = "armed"
+    ctrl = MotionController(cfg)
+    ctrl.start()
+    try:
+        ctrl.connect("mock://braccio", confirm_reset=True)
+        ctrl._link.sim._emit(ctrl.cfg.ready_token)
+        deadline = time.time() + 1
+        while ctrl.export()["joints_known"] and time.time() < deadline:
+            time.sleep(0.01)
+        synced = ctrl.sync_status()
+        assert synced.ok
+        assert ctrl.export()["joints_known"] is True
+        assert ctrl.export()["angles"]["base"] == 90
+    finally:
+        ctrl.shutdown()
+
+
+def test_armed_run_after_stop_reads_status_and_moves():
+    cfg = fast_config()
+    cfg.mode = "armed"
+    cfg.sim_joint_s = 0.2
+    with client_for(cfg) as client:
+        connected = client.post("/api/serial/connect", json={"port": "mock://braccio", "confirm_reset": True})
+        assert connected.status_code == 200
+        client.post("/api/command", json={"text": "Pick up the orange cup."})
+        client.post("/api/run")
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            robot = client.get("/api/state").json()["robot"]
+            if robot["commands_sent"] > 0:
+                break
+            time.sleep(0.02)
+        client.post("/api/stop")
+        stopped = client.get("/api/state").json()
+        assert stopped["mission"]["plan"] is not None
+        assert stopped["robot"]["joints_known"] is False
+        again = client.post("/api/run")
+        assert again.status_code == 200
+        finished = wait_mission(client)
+        assert finished["robot"]["joints_known"] is True
+        assert finished["robot"]["commands_sent"] > stopped["robot"]["commands_sent"]
 
 
 def test_lost_serial_stop_is_not_confirmed():
@@ -324,7 +383,7 @@ def test_multi_object_purges_before_the_next_sample():
         assert state["mission"]["status"] == "complete"
 
 
-def test_dry_run_stop_interrupts_and_requires_a_new_command():
+def test_dry_run_stop_interrupts_and_the_same_plan_can_run_again():
     cfg = fast_config()
     cfg.sim_joint_s = 0.45
     with client_for(cfg) as client:
@@ -346,12 +405,12 @@ def test_dry_run_stop_interrupts_and_requires_a_new_command():
         time.sleep(0.3)
         later = client.get("/api/state").json()
         assert later["mission"]["status"] == "stopped"
-        assert later["mission"]["plan"] is None
+        assert later["mission"]["plan"] is not None
         assert later["robot"]["moving"] is False
-        refused = client.post("/api/run")
-        assert refused.status_code == 400
         jog = client.post("/api/jog", json={"joint": "base", "delta": 5})
         assert jog.status_code == 200
+        again = client.post("/api/run")
+        assert again.status_code == 200
 
 
 def test_manual_jog_is_rejected_during_a_mission_and_limits_apply():
@@ -552,8 +611,35 @@ def test_the_arm_aims_at_the_object_wherever_it_sits_in_the_photo():
     corner = aim_from_bbox([30, 40, 50, 80], cfg)["grasp"]["base"]
     middle = aim_from_bbox([280, 180, 70, 90], cfg)["grasp"]["base"]
     far_side = aim_from_bbox([540, 300, 40, 70], cfg)["grasp"]["base"]
-    # Image-left → higher base (robot left / +Y). Image-right → lower base.
-    assert corner > middle > far_side
+    # Image-left → lower base. Image-right → higher base.
+    assert corner < middle < far_side
+    cfg.aim_offset_x = 2
+    cfg.aim_offset_y = 2
+    cfg.aim_offset_z = 2
+    high_left = [199, 20, 50, 70]
+    shifted = aim_from_bbox(high_left, cfg)["grasp"]
+    plain = aim_from_bbox(high_left, fast_config())["grasp"]
+    assert shifted["base"] < plain["base"]
+    assert shifted["shoulder"] < plain["shoulder"]
+    assert shifted["wrist_vertical"] < plain["wrist_vertical"]
+    low_right = [428, 270, 40, 40]
+    nearer = aim_from_bbox(low_right, cfg)["grasp"]
+    plain_near = aim_from_bbox(low_right, fast_config())["grasp"]
+    assert nearer["base"] > plain_near["base"]
+    assert nearer["shoulder"] > plain_near["shoulder"]
+    assert nearer["wrist_vertical"] > plain_near["wrist_vertical"]
+    cfg.aim_offset_x = cfg.aim_offset_y = cfg.aim_offset_z = 1.2
+    sample = [236, 140, 40, 40]
+    plain_move = aim_from_bbox(sample, fast_config())
+    scaled_move = aim_from_bbox(sample, cfg)
+    center = aim_from_bbox([300, 220, 40, 40], fast_config())["grasp"]
+    for joint, gain in (("base", 1.2), ("shoulder", 1.2), ("wrist_vertical", 1.2)):
+        movement = plain_move["grasp"][joint] - center[joint]
+        assert abs((scaled_move["grasp"][joint] - center[joint]) - movement * gain) < 0.05
+    plain_lift = plain_move["grasp"]["wrist_vertical"] - plain_move["lift"]["wrist_vertical"]
+    scaled_lift = scaled_move["grasp"]["wrist_vertical"] - scaled_move["lift"]["wrist_vertical"]
+    assert abs(scaled_lift - plain_lift * 1.2) < 0.05
+    cfg.aim_offset_x = cfg.aim_offset_y = cfg.aim_offset_z = 1
     near = aim_from_bbox([280, 360, 60, 80], cfg)["grasp"]
     far = aim_from_bbox([280, 40, 60, 80], cfg)["grasp"]
     assert abs(near["base"] - far["base"]) < 1

@@ -5,6 +5,13 @@ server:
   host: 127.0.0.1
   port: 8000
 
+# Multipliers on how far a camera target moves the arm from the middle of the photo.
+# 1 is the normal aim. Higher makes far/near, left/right, and up/down travel farther.
+aim:
+  offset_x: 1
+  offset_y: 1
+  offset_z: 1
+
 execution:
   # dry_run validates and simulates motion. armed sends UART through the motion controller.
   mode: dry_run

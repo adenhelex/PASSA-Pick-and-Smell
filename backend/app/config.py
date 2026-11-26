@@ -126,6 +126,9 @@ class Config:
     zones: dict[str, Zone]
     objects: dict[str, SceneObject]
     calibration: dict
+    aim_offset_x: float = 1
+    aim_offset_y: float = 1
+    aim_offset_z: float = 1
     pose_errors: list[str] = field(default_factory=list)
 
     @classmethod
@@ -160,6 +163,7 @@ class Config:
                 grasp=_pose(spec["grasp"]),
                 lift=_pose(spec["lift"]),
             )
+        aim = data.get("aim") or {}
         objects = {}
         for oid, spec in data["objects"].items():
             objects[oid] = SceneObject(
@@ -227,6 +231,9 @@ class Config:
             zones=zones,
             objects=objects,
             calibration=data["calibration"],
+            aim_offset_x=float(aim.get("offset_x", 1) or 1),
+            aim_offset_y=float(aim.get("offset_y", 1) or 1),
+            aim_offset_z=float(aim.get("offset_z", 1) or 1),
         )
         cfg.pose_errors = validate_taught_poses(cfg)
         return cfg

@@ -115,6 +115,9 @@ export default function Dashboard() {
   const askCycle = useRef(0);
   const wasRunning = useRef(false);
   const askForVoiceCommandRef = useRef<() => Promise<void>>(async () => undefined);
+  const [offset, setOffset] = useState({ x: 1, y: 1, z: 1 });
+  const offsetReady = useRef(false);
+  const offsetTimer = useRef(0);
 
   useEffect(() => {
     let source: EventSource | null = null;
@@ -141,6 +144,17 @@ export default function Dashboard() {
       window.clearInterval(poll);
     };
   }, []);
+
+  useEffect(() => {
+    const settings = state?.settings;
+    if (!settings || offsetReady.current) return;
+    setOffset({
+      x: Number(settings.aim_offset_x ?? 1) || 1,
+      y: Number(settings.aim_offset_y ?? 1) || 1,
+      z: Number(settings.aim_offset_z ?? 1) || 1,
+    });
+    offsetReady.current = true;
+  }, [state?.settings]);
 
   useEffect(() => {
     voiceLoopRef.current = voiceLoop;
@@ -250,6 +264,38 @@ export default function Dashboard() {
     setNotice("");
     try {
       return await post(path, body);
+    } catch {
+      setOffline(true);
+      setNotice("The Python backend is not reachable.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function refreshPorts() {
+    try {
+      const response = await fetch(`${BACKEND}/api/devices?refresh=1`);
+      if (!response.ok) throw new Error("refresh failed");
+      setDevices(await response.json());
+    } catch {
+      setNotice("Could not refresh the serial ports.");
+    }
+  }
+
+  async function connectSerial(port: string) {
+    if (!port) {
+      setNotice("Select a serial port first.");
+      return;
+    }
+    const mode = port.startsWith("mock://") ? "mock" : "hardware";
+    if (mode === "hardware" && !window.confirm("Opening the port can reset the Arduino Uno and command its home pose. Connect?")) return;
+    setBusy(true);
+    setNotice("");
+    try {
+      const saved = await post("/api/settings", { serial_mode: mode, serial_port: port });
+      if (!saved) return;
+      await post("/api/serial/connect", { port, confirm_reset: true });
+      setDraft((current) => (current ? { ...current, serial_mode: mode, serial_port: port } : current));
     } catch {
       setOffline(true);
       setNotice("The Python backend is not reachable.");
@@ -393,6 +439,24 @@ export default function Dashboard() {
     call("/api/jog", { joint, delta });
   }
 
+  function changeOffset(axis: "x" | "y" | "z", value: number) {
+    if (!Number.isFinite(value)) return;
+    const next = { ...offset, [axis]: Math.round(Math.min(4, Math.max(0.5, value)) * 100) / 100 };
+    setOffset(next);
+    window.clearTimeout(offsetTimer.current);
+    offsetTimer.current = window.setTimeout(() => {
+      void fetch(`${BACKEND}/api/settings`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          aim_offset_x: next.x,
+          aim_offset_y: next.y,
+          aim_offset_z: next.z,
+        }),
+      }).catch(() => setNotice("Could not save the move scale."));
+    }, 150);
+  }
+
   async function chooseCamera(value: string, label = "") {
     if (!draft) return;
     const previous = { camera_mode: draft.camera_mode, camera_index: draft.camera_index };
@@ -447,6 +511,10 @@ export default function Dashboard() {
       ? llmModels
       : [draft.llm_model, ...llmModels].filter(Boolean)
     : llmModels;
+  const selectedPort = draft?.serial_port || robot?.port || "";
+  const portOptions = devices.ports.some((port) => port.device === selectedPort) || !selectedPort
+    ? devices.ports
+    : [...devices.ports, { device: selectedPort, description: "Current" }];
   const cameras = devices.cameras.length ? devices.cameras : [{ id: "mock", label: "Mock tabletop camera" }];
   const selectedCamera = draft ? (draft.camera_mode === "hardware" ? String(draft.camera_index) : "mock") : "mock";
   const cameraOptions = cameras.some((camera) => camera.id === selectedCamera)
@@ -892,10 +960,92 @@ export default function Dashboard() {
             <div className="body">
               <p className="meta">
                 {robot?.execution_mode === "armed" ? "Armed" : "Dry-run"} ·{" "}
-                {robot?.serial_connected ? "serial connected" : "serial not connected"} ·{" "}
+                {robot?.serial_connected ? `serial connected${robot.port ? ` · ${robot.port}` : ""}` : "serial not connected"} ·{" "}
                 {robot?.activity === "moving" ? "moving" : "idle"}
                 {robot?.synced ? " · status synced" : ""}
               </p>
+              <label className="serial-pick">
+                Serial port
+                <select
+                  aria-label="Serial port"
+                  value={selectedPort}
+                  disabled={busy || active || !draft}
+                  onChange={(event) => {
+                    if (!draft) return;
+                    const port = event.target.value;
+                    const mode = port.startsWith("mock://") ? "mock" : port ? "hardware" : draft.serial_mode;
+                    setDraft({ ...draft, serial_port: port, serial_mode: mode });
+                  }}
+                >
+                  <option value="">Select a port</option>
+                  {portOptions.map((port) => (
+                    <option key={port.device} value={port.device}>
+                      {port.device}{port.description ? ` · ${port.description}` : ""}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <div className="row">
+                <button type="button" disabled={busy || active} onClick={() => void refreshPorts()}>Refresh ports</button>
+                <button type="button" disabled={busy || active || !selectedPort} onClick={() => void connectSerial(selectedPort)}>Connect</button>
+                <button type="button" disabled={busy || active || !robot?.serial_connected} onClick={() => call("/api/serial/disconnect")}>Disconnect</button>
+              </div>
+              <div className="offsets">
+                <div className="offset-head">
+                  <span>Move scale</span>
+                  <button
+                    type="button"
+                    className="tiny"
+                    disabled={busy || active}
+                    onClick={() => {
+                      setOffset({ x: 1, y: 1, z: 1 });
+                      window.clearTimeout(offsetTimer.current);
+                      void fetch(`${BACKEND}/api/settings`, {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ aim_offset_x: 1, aim_offset_y: 1, aim_offset_z: 1 }),
+                      }).catch(() => setNotice("Could not save the move scale."));
+                    }}
+                  >
+                    Reset
+                  </button>
+                </div>
+                {(
+                  [
+                    ["x", "Far / near"],
+                    ["y", "Left / right"],
+                    ["z", "Up / down"],
+                  ] as const
+                ).map(([axis, label]) => (
+                  <label key={axis} className="offset">
+                    <span>{label}</span>
+                    <input
+                      type="range"
+                      min={0.5}
+                      max={4}
+                      step={0.01}
+                      aria-label={label}
+                      value={offset[axis]}
+                      disabled={busy || active}
+                      onChange={(event) => changeOffset(axis, Number(event.target.value))}
+                    />
+                    <span className="offset-value">
+                      <input
+                        type="number"
+                        min={0.5}
+                        max={4}
+                        step={0.01}
+                        inputMode="decimal"
+                        aria-label={`${label} number`}
+                        value={Number(offset[axis]).toFixed(2)}
+                        disabled={busy || active}
+                        onChange={(event) => changeOffset(axis, Number(event.target.value))}
+                      />
+                      <span>×</span>
+                    </span>
+                  </label>
+                ))}
+              </div>
               <p className="section-title" style={{ paddingLeft: 0 }}>
                 Commanded joint angles
               </p>

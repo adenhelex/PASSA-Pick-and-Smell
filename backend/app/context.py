@@ -102,6 +102,9 @@ class Context:
             "enose_mode": self.enose.mode,
             "enose_base_url": self.enose.base_url,
             "baud": self.cfg.baud,
+            "aim_offset_x": self.cfg.aim_offset_x,
+            "aim_offset_y": self.cfg.aim_offset_y,
+            "aim_offset_z": self.cfg.aim_offset_z,
         }
 
     def subscribe(self, loop: asyncio.AbstractEventLoop, queue: asyncio.Queue) -> None:

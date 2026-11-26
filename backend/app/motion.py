@@ -799,6 +799,10 @@ class MotionController:
             if angles and line == "status":
                 return {"kind": "status", "angles": angles}
             if text == self.cfg.ready_token:
+                # A reboot notice often sits in the buffer after Stop. A status
+                # read should skip it and take the pose that follows.
+                if line == "status":
+                    continue
                 return {
                     "kind": "reset",
                     "detail": "The Arduino reset unexpectedly. Status must be read again.",

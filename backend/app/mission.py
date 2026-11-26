@@ -122,23 +122,42 @@ class Mission:
             return {"kind": "plan", "plan": self._apply(result)}
         return {"kind": "plan", "plan": self._build_plan()}
 
+    def _recover_motion(self) -> dict:
+        """Read the arm after a stop or a board reset so the next run can move."""
+        robot = self.motion.export()
+        if robot["execution_mode"] != "armed":
+            if not robot["joints_known"]:
+                raise MissionError("Commanded joint angles are unknown. Sync status or reset the dry-run pose.")
+            return robot
+        if not robot["serial_connected"]:
+            raise MissionError(
+                "Armed motion needs a synchronized serial status. Connect and query status, or switch to dry-run."
+            )
+        if robot["synced"] and not robot["needs_status_sync"] and robot["joints_known"]:
+            return robot
+        result = None
+        for _ in range(2):
+            result = self.motion.sync_status()
+            robot = self.motion.export()
+            if result.ok and robot["synced"] and robot["joints_known"]:
+                return robot
+        detail = result.detail if result is not None else "Status did not synchronize."
+        raise MissionError(
+            "Armed motion needs a synchronized serial status. Connect and query status, or switch to dry-run. " + detail
+        )
+
     def run(self) -> dict:
         if self._running():
             raise MissionError("A mission is already running.", 409)
         if self.clarification is not None or self.status == "awaiting_clarification":
             raise MissionError("Answer the question before running.")
         if not self.plan or self.plan.get("status") != "ready":
-            raise MissionError("Plan a command before running. Stopping cancels the previous plan.")
+            raise MissionError("Plan a command before running.")
         if self.plan.get("epoch") != self.settings_epoch:
             raise MissionError("Device settings changed. Plan again before running.")
-        robot = self.motion.export()
-        if robot["execution_mode"] == "armed" and (
-            not robot["serial_connected"] or not robot["synced"] or robot["needs_status_sync"]
-        ):
-            raise MissionError("Armed motion needs a synchronized serial status. Connect and query status, or switch to dry-run.")
-        if not robot["joints_known"]:
-            raise MissionError("Commanded joint angles are unknown. Sync status or reset the dry-run pose.")
         self._cancel.clear()
+        self.motion.release_cancel()
+        robot = self._recover_motion()
         self.motion.release_cancel()
         self.motion.set_mission_active(True)
         with self._lock:
@@ -157,6 +176,9 @@ class Mission:
         self._cancel.set()
         self._clarify.set()
         result = self.motion.stop()
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=2.0)
         payload = {
             "software_stop": result.software_stop,
             "uart_sent": result.uart_sent,
@@ -165,7 +187,6 @@ class Mission:
         }
         with self._lock:
             self.last_stop = payload
-            self.plan = None
             self.clarification = None
             self.status = "stopped"
             self.phase = "stopped"
