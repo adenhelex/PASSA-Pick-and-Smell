@@ -6,6 +6,7 @@ import asyncio
 import sys
 import threading
 
+from app.cover import tool_export
 from app.config import Config
 from app.enose import ENose
 from app.mission import Mission
@@ -105,6 +106,8 @@ class Context:
             "aim_offset_x": self.cfg.aim_offset_x,
             "aim_offset_y": self.cfg.aim_offset_y,
             "aim_offset_z": self.cfg.aim_offset_z,
+            "sample_hold_s": self.cfg.sample_hold_s,
+            "tool": tool_export(self.cfg, self.motion.mode == "armed"),
         }
 
     def subscribe(self, loop: asyncio.AbstractEventLoop, queue: asyncio.Queue) -> None:

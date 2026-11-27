@@ -6,13 +6,14 @@ import { ArmState, BACKEND, DeviceList, JOINTS, JointName, SmellRecord } from ".
 import { VoiceLang, hasThai, listen, speak, speechSupported, voiceLooksWrong } from "../lib/voice";
 
 const PHASES = [
-  ["scanning", "Scanning"],
-  ["target_found", "Target found"],
-  ["approaching", "Approaching"],
-  ["grasping", "Grasping"],
-  ["sampling", "Sampling"],
-  ["placing", "Placing"],
-  ["complete", "Complete"],
+  ["scanning", "Scan"],
+  ["target_found", "Locate"],
+  ["approaching", "Approach"],
+  ["aligning", "Align"],
+  ["lowering", "Lower"],
+  ["sampling", "Sample"],
+  ["retracting", "Raise"],
+  ["complete", "Park"],
 ];
 
 function hostFromBase(url: string) {
@@ -116,6 +117,9 @@ export default function Dashboard() {
   const wasRunning = useRef(false);
   const askForVoiceCommandRef = useRef<() => Promise<void>>(async () => undefined);
   const [offset, setOffset] = useState({ x: 1, y: 1, z: 1 });
+  const [coverPark, setCoverPark] = useState("73");
+  const [coverSample, setCoverSample] = useState("10");
+  const [coverHold, setCoverHold] = useState("10");
   const offsetReady = useRef(false);
   const offsetTimer = useRef(0);
 
@@ -155,6 +159,19 @@ export default function Dashboard() {
     });
     offsetReady.current = true;
   }, [state?.settings]);
+
+  useEffect(() => {
+    const tool = state?.settings.tool;
+    if (!tool) return;
+    setCoverPark(String(tool.park_servo_deg));
+    setCoverSample(String(tool.sample_servo_deg));
+  }, [state?.settings.tool?.park_servo_deg, state?.settings.tool?.sample_servo_deg]);
+
+  useEffect(() => {
+    const seconds = state?.settings.sample_hold_s;
+    if (seconds == null) return;
+    setCoverHold(String(seconds));
+  }, [state?.settings.sample_hold_s]);
 
   useEffect(() => {
     voiceLoopRef.current = voiceLoop;
@@ -457,6 +474,23 @@ export default function Dashboard() {
     }, 150);
   }
 
+  async function setVisionMode(enabled: boolean) {
+    if (!draft || draft.vlm_enabled === enabled) return;
+    const previous = draft.vlm_enabled;
+    setDraft({ ...draft, vlm_enabled: enabled });
+    try {
+      const response = await fetch(`${BACKEND}/api/settings`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ vlm_enabled: enabled }),
+      });
+      if (!response.ok) throw new Error("switch failed");
+    } catch {
+      setDraft((current) => (current ? { ...current, vlm_enabled: previous } : current));
+      setNotice("Could not switch the detector.");
+    }
+  }
+
   async function chooseCamera(value: string, label = "") {
     if (!draft) return;
     const previous = { camera_mode: draft.camera_mode, camera_index: draft.camera_index };
@@ -526,7 +560,7 @@ export default function Dashboard() {
       <header className="top">
         <div className="brand">
           <strong>PASSA</strong>
-          <span>Pick and smell</span>
+          <span>Cover and sample</span>
         </div>
         <span className={armed ? "mode-pill armed" : "mode-pill dry"}>{armed ? "Armed" : "Dry-run"}</span>
         <span className="link-pill">
@@ -567,6 +601,12 @@ export default function Dashboard() {
             selectedId={state?.observation.selected_id ?? null}
             phase={mission?.phase ?? ""}
             showDefaultScene={(state?.observation.mode ?? "mock") !== "hardware"}
+            cover={{
+              park: state?.settings.tool?.park_servo_deg ?? 73,
+              sample: state?.settings.tool?.sample_servo_deg ?? 10,
+              parkTilt: state?.settings.tool?.design_tilt_at_park_deg ?? -63,
+              sampleTilt: state?.settings.tool?.design_tilt_at_sample_deg ?? -38,
+            }}
           />
         </section>
         <section className="panel records">
@@ -630,6 +670,25 @@ export default function Dashboard() {
               {devices.scanning ? "Looking…" : "Refresh"}
             </button>
           </div>
+          <div className="detect-switch" role="group" aria-label="Detection mode">
+            <button
+              type="button"
+              className={draft?.vlm_enabled ? "" : "on"}
+              disabled={busy || active || !draft}
+              onClick={() => setVisionMode(false)}
+            >
+              YOLO
+            </button>
+            <button
+              type="button"
+              className={draft?.vlm_enabled ? "on" : ""}
+              disabled={busy || active || !draft}
+              onClick={() => setVisionMode(true)}
+            >
+              YOLO + VLM
+            </button>
+            {state?.observation.describe_status && <span>{state.observation.describe_status}</span>}
+          </div>
           {(state?.observation.camera_status || state?.observation.video_error || devices.camera_error) && (
             <p className={state?.observation.video_error || devices.camera_error ? "camera-error" : "camera-status"}>
               {state?.observation.video_error || state?.observation.camera_status || devices.camera_error}
@@ -669,7 +728,7 @@ export default function Dashboard() {
                     height: `${(item.bbox[3] / 480) * 100}%`,
                   }}
                 >
-                  <span>
+                  <span title={item.attributes?.find((part) => part.toLowerCase() !== (item.label || "").toLowerCase()) || item.name}>
                     {item.name}
                     {item.uncertain ? " · uncertain" : ""}
                     {item.id === state.observation.selected_id ? " · target" : ""}
@@ -684,6 +743,7 @@ export default function Dashboard() {
           </div>
         </section>
 
+        <div className="command-column">
         <section className="panel command">
           <header>
             Command
@@ -863,38 +923,16 @@ export default function Dashboard() {
             </div>
             {notice && <p className="note">{notice}</p>}
             {mission?.error && <p className="note">{mission.error}</p>}
-            {mission?.clarification && (
+            {mission?.clarification && !mission.clarification.expects_text && (
               <div className="question">
                 <strong>{mission.clarification.question}</strong>
-                {mission.clarification.expects_text ? (
-                  <form
-                    className="row"
-                    onSubmit={(event) => {
-                      event.preventDefault();
-                      const text = inside.trim();
-                      if (!text) return;
-                      setInside("");
-                      void startMission("/api/clarify", { text });
-                    }}
-                  >
-                    <input
-                      value={inside}
-                      onChange={(event) => setInside(event.target.value)}
-                      placeholder="What is inside?"
-                    />
-                    <button className="primary" type="submit">
-                      Save answer
+                <div className="choices">
+                  {mission.clarification.options.map((option) => (
+                    <button key={option.id} className="choice" onClick={() => startMission("/api/clarify", { object_id: option.id })}>
+                      {option.label}
                     </button>
-                  </form>
-                ) : (
-                  <div className="choices">
-                    {mission.clarification.options.map((option) => (
-                      <button key={option.id} className="choice" onClick={() => startMission("/api/clarify", { object_id: option.id })}>
-                        {option.label}
-                      </button>
-                    ))}
-                  </div>
-                )}
+                  ))}
+                </div>
               </div>
             )}
             {mission?.plan && (
@@ -921,10 +959,111 @@ export default function Dashboard() {
             )}
           </div>
         </section>
+        {mission?.clarification?.expects_text && (
+          <section className="panel contents-ask">
+            <header>What's inside</header>
+            <div className="body">
+              <strong>{mission.clarification.question}</strong>
+              <form
+                className="contents-form"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  const text = inside.trim();
+                  if (!text) return;
+                  setInside("");
+                  void startMission("/api/clarify", { text });
+                }}
+              >
+                <input
+                  aria-label="What is inside"
+                  value={inside}
+                  autoFocus
+                  onChange={(event) => setInside(event.target.value)}
+                  placeholder="What is inside?"
+                />
+                <button className="primary" type="submit">
+                  Save answer
+                </button>
+              </form>
+            </div>
+          </section>
+        )}
+        </div>
 
         <section className="panel">
           <header>Mission</header>
           <div className="body">
+            <div className="tool-card">
+              <strong>{state?.settings.tool?.name ?? "Cylinder sampling cover"}</strong>
+              <p className="meta">
+                {armed ? "Hardware" : "Dry-run"}
+                {" · "}
+                Cover tilt {robot?.angles.gripper == null ? "—" : `${Math.round(robot.angles.gripper)}°`}
+                {" · "}
+                {mission?.phase || "idle"}
+                {mission?.record.selected ? ` · ${mission.record.selected.name}` : ""}
+              </p>
+              {state?.settings.tool?.assumption && <p className="meta">{state.settings.tool.assumption}</p>}
+              {state?.settings.tool?.descent_block && <p className="warn">{state.settings.tool.descent_block}</p>}
+              {mission?.hold_remaining_s != null && (
+                <p className="hold-clock" aria-live="polite">
+                  {mission.hold_label || "Sampling"} · {mission.hold_remaining_s}s left
+                </p>
+              )}
+              <div className="cover-angles">
+                <label>
+                  Park angle
+                  <input
+                    type="number"
+                    min={10}
+                    max={73}
+                    step={1}
+                    aria-label="Cover park angle"
+                    value={coverPark}
+                    disabled={busy || active}
+                    onChange={(event) => setCoverPark(event.target.value)}
+                    onBlur={() => {
+                      const value = Number(coverPark);
+                      if (Number.isFinite(value)) void call("/api/settings", { cover_park_deg: value });
+                    }}
+                  />
+                </label>
+                <label>
+                  Sampling angle
+                  <input
+                    type="number"
+                    min={10}
+                    max={73}
+                    step={1}
+                    aria-label="Cover sampling angle"
+                    value={coverSample}
+                    disabled={busy || active}
+                    onChange={(event) => setCoverSample(event.target.value)}
+                    onBlur={() => {
+                      const value = Number(coverSample);
+                      if (Number.isFinite(value)) void call("/api/settings", { cover_sample_deg: value });
+                    }}
+                  />
+                </label>
+                <label>
+                  Cover hold (s)
+                  <input
+                    type="number"
+                    min={1}
+                    max={120}
+                    step={1}
+                    aria-label="Cover hold seconds"
+                    value={coverHold}
+                    disabled={busy || active}
+                    onChange={(event) => setCoverHold(event.target.value)}
+                    onBlur={() => {
+                      const value = Number(coverHold);
+                      if (Number.isFinite(value)) void call("/api/settings", { sample_hold_s: value });
+                    }}
+                  />
+                </label>
+              </div>
+            </div>
             <div className="rail">
               {PHASES.map(([id, label]) => (
                 <span key={id} className={mission?.phase === id ? "on" : ""}>
@@ -1096,8 +1235,8 @@ export default function Dashboard() {
               {active && <p className="warn">Manual jog is disabled during an active mission.</p>}
               <div className="row">
                 <button disabled={busy || active} onClick={() => call("/api/home")}>Home</button>
-                <button disabled={busy || active} onClick={() => call("/api/gripper", { action: "open" })}>Gripper open</button>
-                <button disabled={busy || active} onClick={() => call("/api/gripper", { action: "close" })}>Gripper close</button>
+                <button disabled={busy || active} onClick={() => call("/api/gripper", { action: "park" })}>Cover park</button>
+                <button disabled={busy || active} onClick={() => call("/api/gripper", { action: "sample" })}>Cover sample</button>
               </div>
               {JOINTS.map((joint) => (
                 <div key={joint.key} className="jog">
@@ -1177,14 +1316,7 @@ export default function Dashboard() {
                     VLM model id
                     <input value={draft.vlm_model} onChange={(event) => setDraft({ ...draft, vlm_model: event.target.value })} />
                   </label>
-                  <label className="check">
-                    <input
-                      type="checkbox"
-                      checked={draft.vlm_enabled}
-                      onChange={(event) => setDraft({ ...draft, vlm_enabled: event.target.checked })}
-                    />
-                    Use the local VLM on hardware frames
-                  </label>
+                  <p className="meta">Detection mode is the YOLO switch on the camera panel. This address is used when YOLO + VLM is on.</p>
                   <label>
                     E-nose
                     <select value={draft.enose_mode} onChange={(event) => setDraft({ ...draft, enose_mode: event.target.value })}>

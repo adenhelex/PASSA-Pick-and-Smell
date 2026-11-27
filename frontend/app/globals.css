@@ -148,6 +148,27 @@ button { cursor: pointer; }
   font-size: 13px;
 }
 .camera-bar select { flex: 1; min-width: 0; }
+.detect-switch {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  padding: 0 12px 8px;
+}
+.detect-switch button {
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 5px 10px;
+  font-size: 12px;
+  text-transform: none;
+  letter-spacing: 0;
+}
+.detect-switch button.on {
+  background: #173224;
+  border-color: var(--green);
+  color: var(--green);
+}
+.detect-switch span { color: var(--muted); font-size: 12px; }
 .camera-status, .camera-error {
   margin: 0;
   padding: 6px 12px;
@@ -277,6 +298,31 @@ button { cursor: pointer; }
   font-size: 13px;
   color: var(--amber);
 }
+.command-column {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+.contents-ask { border-color: var(--amber); }
+.contents-ask header { color: var(--amber); }
+.contents-ask .body { display: grid; gap: 10px; }
+.contents-ask strong { font-size: 15px; }
+.contents-form { display: flex; gap: 8px; align-items: center; }
+.contents-form input {
+  flex: 1;
+  min-width: 0;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 8px 10px;
+}
+.contents-form button {
+  border: 1px solid #2f7a5b;
+  background: #245c45;
+  border-radius: 6px;
+  padding: 8px 12px;
+}
 .command textarea {
   width: 100%;
   min-height: 72px;
@@ -391,6 +437,26 @@ button { cursor: pointer; }
 .event.observation { color: #d5ecff; }
 .event.clarify { color: #ffd48a; }
 .record { color: var(--muted); font-size: 12px; margin-bottom: 8px; }
+.tool-card {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin-bottom: 10px;
+  display: grid;
+  gap: 4px;
+}
+.tool-card strong { font-size: 13px; }
+.tool-card .meta { margin: 0; }
+.cover-angles { display: flex; gap: 12px; align-items: end; }
+.cover-angles label { display: grid; gap: 2px; font-size: 11px; color: var(--muted); }
+.cover-angles input { width: 76px; }
+.hold-clock {
+  margin: 0;
+  font-size: 22px;
+  font-weight: 650;
+  letter-spacing: 0.01em;
+  color: #d7f4ff;
+}
 
 .side { display: grid; grid-template-rows: auto auto minmax(0, 1fr); gap: 10px; min-height: 0; }
 .side .panel { min-height: 0; }

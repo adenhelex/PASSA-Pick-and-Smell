@@ -317,6 +317,23 @@ class MotionController:
 
     def release_cancel(self) -> None:
         self._cancel.clear()
+
+    def wait_still(self, seconds: float, on_tick) -> bool:
+        """Hold the current pose. Stop cancels the wait. No joint command is sent."""
+        deadline = time.time() + max(0.0, float(seconds))
+        while True:
+            if self._cancel.is_set():
+                return False
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return True
+            try:
+                on_tick(remaining)
+            except Exception:
+                pass
+            if self._cancel.is_set():
+                return False
+            time.sleep(min(0.2, remaining))
         self._stop_seen.clear()
 
     def connect(self, port: str, confirm_reset: bool) -> dict:
@@ -685,14 +702,14 @@ class MotionController:
         problem = self._guard()
         if problem:
             return MoveResult(ok=False, interrupted=problem == "Cancelled by stop.", detail=problem)
-        if self.mode != "armed":
-            angle = self.cfg.gripper_open if action == "open" else self.cfg.gripper_closed
-            return self._command_joint("gripper", int(angle), slow=False)
-        line = "gripper release" if action == "open" else "gripper grab object"
-        outcome = self._exchange(line, self.cfg.motion_timeout_s)
-        if outcome["kind"] == "done":
-            return self._run_status()
-        return self._outcome_to_result(outcome, line)
+        if action in {"park", "open"}:
+            angle = int(round(self.cfg.tool.park_servo_deg))
+        elif action in {"sample", "close"}:
+            angle = int(round(self.cfg.tool.sample_servo_deg))
+        else:
+            return MoveResult(ok=False, detail="Cover action must be park or sample.")
+        # M6 stays the firmware's gripper channel. The line is "gripper rotate <angle>".
+        return self._command_joint("gripper", angle, slow=False)
 
     def _run_home(self) -> MoveResult:
         problem = self._guard()

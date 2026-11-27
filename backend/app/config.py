@@ -50,6 +50,7 @@ class Zone:
     approach: Pose
     grasp: Pose
     lift: Pose
+    cover: Pose | None = None
 
 
 @dataclass
@@ -68,6 +69,44 @@ class SceneObject:
         if self.kind == "fruit" and self.label == "orange":
             return "orange fruit"
         return f"{self.color} {self.kind}".replace("_", " ")
+
+
+@dataclass
+class CoverTool:
+    """Sampling cover. Servo angles and object size stay uncalibrated until measured."""
+
+    name: str = "Cylinder sampling cover"
+    inside_diameter_mm: float = 110
+    clear_height_mm: float = 100
+    body_outside_diameter_mm: float = 112.4
+    flange_outside_diameter_mm: float = 118
+    wall_thickness_mm: float = 1.2
+    roof_thickness_mm: float = 1.6
+    sample_bore_mm: float = 6.2
+    vent_diameter_mm: float = 1.8
+    pivot_x_mm: float = -6
+    pivot_y_mm: float = 40.5
+    pivot_z_mm: float = 47
+    tilt_axis: str = "y"
+    park_servo_deg: float = 73
+    sample_servo_deg: float = 10
+    design_tilt_at_park_deg: float = -63
+    design_tilt_at_sample_deg: float = 0
+    angles_calibrated: bool = False
+    approach_clearance_mm: float = 40
+    seal_standoff_mm: float = 0
+    assumed_object_diameter_mm: float = 100
+    assumed_object_height_mm: float = 80
+    placement_uncertainty_mm: float = 5
+    dimensions_measured: bool = False
+    descent_tolerance_px: float = 48
+    surface_calibrated: bool = False
+    surface_z_mm: float = 0
+    mouth_base_deg: float = 0
+    mouth_shoulder_deg: float = 0
+    mouth_elbow_deg: float = 0
+    mouth_wrist_vertical_deg: float = 0
+    mouth_wrist_rotation_deg: float = 0
 
 
 @dataclass
@@ -126,6 +165,7 @@ class Config:
     zones: dict[str, Zone]
     objects: dict[str, SceneObject]
     calibration: dict
+    tool: CoverTool
     aim_offset_x: float = 1
     aim_offset_y: float = 1
     aim_offset_z: float = 1
@@ -162,6 +202,7 @@ class Config:
                 approach=_pose(spec["approach"]),
                 grasp=_pose(spec["grasp"]),
                 lift=_pose(spec["lift"]),
+                cover=_pose(spec["cover"]) if spec.get("cover") else None,
             )
         aim = data.get("aim") or {}
         objects = {}
@@ -231,12 +272,29 @@ class Config:
             zones=zones,
             objects=objects,
             calibration=data["calibration"],
+            tool=_cover_tool(data.get("tool") or {}),
             aim_offset_x=float(aim.get("offset_x", 1) or 1),
             aim_offset_y=float(aim.get("offset_y", 1) or 1),
             aim_offset_z=float(aim.get("offset_z", 1) or 1),
         )
         cfg.pose_errors = validate_taught_poses(cfg)
         return cfg
+
+
+def _cover_tool(spec: dict) -> CoverTool:
+    defaults = CoverTool()
+    values = {}
+    for name in defaults.__dataclass_fields__:
+        if name in spec and spec[name] is not None:
+            current = getattr(defaults, name)
+            raw = spec[name]
+            if isinstance(current, bool):
+                values[name] = bool(raw)
+            elif isinstance(current, float):
+                values[name] = float(raw)
+            else:
+                values[name] = raw
+    return CoverTool(**values)
 
 
 def _pose(spec: dict) -> Pose:
@@ -260,6 +318,8 @@ def validate_taught_poses(cfg: Config) -> list[str]:
         named.append((f"{zone.id}.approach", zone.approach))
         named.append((f"{zone.id}.grasp", zone.grasp))
         named.append((f"{zone.id}.lift", zone.lift))
+        if zone.cover is not None:
+            named.append((f"{zone.id}.cover", zone.cover))
     for name, pose in named:
         problem = pose_problem(pose.angles(), cfg, gripper=cfg.gripper_open)
         if problem:
@@ -270,6 +330,10 @@ def validate_taught_poses(cfg: Config) -> list[str]:
     low, high = cfg.joint_limits["shoulder"]
     if not low <= cfg.transit_shoulder <= high:
         errors.append("transit_shoulder is outside the shoulder limits")
+    lo, hi = cfg.joint_limits["gripper"]
+    for label, angle in (("park", cfg.tool.park_servo_deg), ("sample", cfg.tool.sample_servo_deg)):
+        if not lo <= angle <= hi:
+            errors.append(f"cover {label} servo {angle} is outside {lo}–{hi}")
     for obj in cfg.objects.values():
         lo, hi = cfg.joint_limits["gripper"]
         if not lo <= obj.close_angle <= hi:

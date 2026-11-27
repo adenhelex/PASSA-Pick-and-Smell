@@ -1,8 +1,8 @@
 """Turn a natural-language instruction into a short tool sequence.
 
 When the local model is on, it only chooses which seen object to use.
-The step list is always the arm's fixed sequence. The built-in word
-matcher runs only when the model is off.
+The step list is always the cover sequence. The built-in word matcher
+runs only when the model is off, and it never replaces a model-chosen id.
 """
 
 from __future__ import annotations
@@ -20,16 +20,23 @@ from app.config import Config
 from app.ollama import ollama_base
 from app.vision import Observation
 
-TOOLS = (
+COVER_SEQUENCE = (
     "scan",
     "inspect",
     "locate",
     "approach",
+    "align",
+    "lower",
+    "sample_odor",
+    "raise",
+    "tilt",
+    "park",
+)
+
+TOOLS = COVER_SEQUENCE + (
     "grasp",
     "lift",
-    "sample_odor",
     "place",
-    "park",
     "report_scene",
 )
 
@@ -38,6 +45,10 @@ TOOL_LABELS = {
     "inspect": "Inspect",
     "locate": "Locate",
     "approach": "Approach",
+    "align": "Align",
+    "lower": "Lower",
+    "raise": "Raise",
+    "tilt": "Tilt",
     "grasp": "Grasp",
     "lift": "Lift",
     "sample_odor": "Sample odor",
@@ -128,7 +139,7 @@ class Planner:
                     missing_capability=capability,
                     summary=(
                         f"I can't do that. {capability.capitalize()} is not one of the arm's tools. "
-                        "I can move to an object, grab it, lift, put it down, and rest."
+                        "I can look for an object, cover it on the table, sample the air, and rest."
                     ),
                     intent="unsupported",
                 )
@@ -150,7 +161,7 @@ class Planner:
             if not specs and not (wants_smell or wants_pick or wants_find):
                 return PlanResult(
                     status="clarification",
-                    question="What should I do? I can find something, pick it up, smell it, or put it down.",
+                    question="What should I do? I can find something, cover it on the table, and sample the air.",
                     intent="unclear",
                 )
             if not specs:
@@ -177,7 +188,7 @@ class Planner:
             else:
                 return PlanResult(
                     status="clarification",
-                    question="Should I pick it up, smell it, or only look?",
+                    question="Should I cover and sample it, or only look?",
                     intent="unclear",
                 )
         result.enose_note = _enose_note(result, enose_mode)
@@ -257,9 +268,9 @@ class Planner:
         return PlanResult(
             status="ready",
             intent="noop",
-            summary="ได้ครับ จะไม่หยิบอะไร" if thai else "Okay. I will not pick anything.",
-            final_state="Standing by. Nothing is picked up.",
-            steps=[_step("park", "Stay at the rest pose. Do not grasp.")],
+            summary="ได้ครับ จะไม่ครอบอะไร" if thai else "Okay. I will not cover or sample anything.",
+            final_state="Standing by. Nothing is covered.",
+            steps=[_step("park", "Stay at the rest pose. Do not lower the cover.")],
             targets=[],
             planner="built-in",
             planner_note="The instruction said not to pick anything.",
@@ -275,8 +286,8 @@ class Planner:
         return PlanResult(
             status="ready",
             intent="survey",
-            summary="Scan the table and report what is visible. The arm will not grasp.",
-            final_state="The arm is back at the rest pose. Nothing is picked up.",
+            summary="Scan the table and report what is visible. The arm will not cover an object.",
+            final_state="The arm is back at the rest pose. Nothing is covered.",
             steps=steps,
         )
 
@@ -285,52 +296,56 @@ class Planner:
         for index, item in enumerate(resolved):
             steps.append(_step("inspect", f"Look for the {item['phrase']}.", index, item))
             steps.append(_step("locate", f"Identify the {item['phrase']} and check whether it is reachable.", index, item))
-        steps.append(_step("park", "Return to the rest pose."))
         names = _join(item["name"] for item in resolved)
         return PlanResult(
             status="ready",
             intent="find",
-            summary=f"Look for {names}. I will not pick anything up.",
-            final_state="The arm is back at the rest pose. Nothing is picked up.",
+            summary=f"Look for {names}. I will stop after locating it and will not cover or sample it.",
+            final_state="The object is located. The arm stays at the scan pose. Nothing is covered.",
             steps=steps,
             targets=resolved,
         )
 
     def _manipulate(self, resolved, smell: bool, place: bool, destination: str | None, put_back: bool) -> PlanResult:
-        # Fixed short sequence: move → grab → lift → put down → rest.
-        steps = []
+        # Fixed cover sequence. The object stays on the table. Smell is always sampled.
+        steps = [_step("scan", "Scan before covering the object.", 0, resolved[0])]
         for index, item in enumerate(resolved):
             name = item["name"]
-            steps.append(_step("approach", f"Move to the {name} with the gripper open.", index, item))
-            steps.append(_step("grasp", f"Grab the {name}.", index, item))
-            steps.append(_step("lift", f"Lift the {name}.", index, item))
+            steps.append(_step("inspect", f"Inspect the {name}.", index, item))
+            steps.append(_step("locate", f"Locate the {name}. It stays on the table.", index, item))
+            steps.append(_step("approach", f"Reach out over the {name} with the cup still sideways.", index, item))
+            steps.append(_step("align", f"Turn the cup so the opening faces straight down over the {name}. The arm stays put.", index, item))
+            steps.append(
+                _step(
+                    "lower",
+                    f"Drop the cup straight down until the rim reaches the covering pose around the {name}. "
+                    f"The opening stays facing down. The {name} stays on the surface.",
+                    index,
+                    item,
+                )
+            )
             if smell:
+                hold = float(self.cfg.sample_hold_s)
                 steps.append(
                     _step(
                         "sample_odor",
-                        f"Read the smell of the {name} without leaving the lift pose.",
+                        f"Hold the cover still over the {name} for {hold:g} seconds while sampling odor. "
+                        f"The {name} stays on the surface.",
                         index,
                         item,
                     )
                 )
-            if place:
-                if put_back or destination is None:
-                    place_detail = f"Put the {name} back down."
-                    place_dest = "original"
-                else:
-                    place_detail = f"Put the {name} on the {destination}."
-                    place_dest = destination
-                steps.append(_step("place", place_detail, index, item, destination=place_dest))
-        steps.append(_step("park", "Rest at the park pose."))
+            steps.append(_step("raise", f"Raise the cup straight up until it is clear of the {name}.", index, item))
+            steps.append(_step("tilt", f"Tilt the cover to the park angle now that it is clear of the {name}.", index, item))
+        steps.append(_step("park", "Rest at the park pose with the cover at its dry-run park angle."))
         names = _join(item["name"] for item in resolved)
-        if smell and place:
-            summary = f"Pick up {names}, sample at the wrist inlet, put it down, then rest."
-        elif smell:
-            summary = f"Pick up {names} and hold it at the wrist inlet for a sample."
-        elif place:
-            summary = f"Pick up {names}, put it down, then rest."
-        else:
-            summary = f"Pick up {names}."
+        titled = f"{names[0].upper()}{names[1:]}"
+        summary = (
+            f"{titled} stays on the table. Cylinder mode will cover it and sample the air inside, "
+            "then raise and park. It will not be picked up."
+        )
+        if place and destination and not put_back:
+            summary += f" The request asked to put it on the {destination}. Cylinder mode leaves it where it is."
         final = _final_state(resolved, smell, place, destination, put_back)
         summary = _with_reach_notes(self.cfg, resolved, summary)
         return PlanResult(
@@ -388,7 +403,8 @@ class Planner:
                 intent="clarify",
             )
         system = (
-            "You alone choose which seen object to pick. The app uses your id exactly and does not replace it. "
+            "You alone choose which seen object to cover. The app uses your id exactly and does not replace it. "
+            "The arm covers that object where it stands and samples the air. It does not lift the object. "
             "A new command is still your decision: use name, kind, thai, across, depth, cx, cy, and from_left. "
             "The instruction may be English or Thai. Read either language the same way. "
             "thai lists Thai words for that seen object. Match Thai instructions using thai and kind. "
@@ -471,7 +487,7 @@ class Planner:
         return result
 
     def _fixed_sequence(self, text: str, item: Observation) -> PlanResult:
-        """Move to the object, grab, lift, smell, put down, rest. A find-only request does not smell."""
+        """Cover and sample the object on the table. A find-only request stops after locate."""
         bound = _bind(TargetSpec(color=None, kind=None, phrase=item.name), item)
         low = text.lower()
         wants_pick = bool(re.search(r"\b(pick|grab|grasp|lift)\b", low))
@@ -945,19 +961,9 @@ def _final_state(resolved, smell, place, destination, put_back) -> str:
     sentences = []
     for item in resolved:
         name = item["name"]
-        if place and (put_back or destination is None):
-            where = item["zone"] or "its start zone"
-            sentences.append(f"The {name} is back on the {where} zone.")
-        elif place and destination:
-            sentences.append(f"The {name} is on the {destination}.")
-        elif smell:
-            sentences.append(
-                f"The arm parks while still holding the {name}, because the instruction did not say where to put it."
-            )
-        else:
-            sentences.append(f"The arm parks while still holding the {name}.")
-    if not any("holding" in sentence for sentence in sentences):
-        sentences.append("The arm is at the rest pose with the gripper open.")
+        where = item.get("zone") or "table"
+        sentences.append(f"The {name} stays on the {where}.")
+    sentences.append("The arm parks with the cover at the dry-run park angle.")
     return " ".join(sentences)
 
 

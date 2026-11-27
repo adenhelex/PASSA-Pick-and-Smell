@@ -20,7 +20,8 @@ execution:
   # How often a dry-run move publishes the commanded pose while a joint is traveling.
   pose_hz: 30
   lift_segments: 3
-  sample_hold_s: 0.6
+  # Seconds the cover stays still over the object after the rim reaches the covering pose.
+  sample_hold_s: 10
   enose_step_s: 0.35
 
 serial:
@@ -47,11 +48,12 @@ llm:
   timeout_s: 12
 
 vlm:
-  # Ollama's native chat API. llava:latest is the local vision model.
+  # When this is on, YOLO finds each object and this model describes it.
+  # The camera panel can switch it off for detector names only.
   enabled: true
   api: ollama
   base_url: "http://127.0.0.1:11434"
-  model: "llava:latest"
+  model: "qwen3-vl:8b-instruct"
   timeout_s: 25
 
 enose:
@@ -87,6 +89,45 @@ joints:
   wrist_vertical: {min: 0, max: 180}
   wrist_rotation: {min: 0, max: 180}
   gripper: {min: 10, max: 73, open: 10, closed: 73}
+
+# Cylinder sampling cover. The jaw close_angle values below stay so older configs
+# still load. Cylinder mode does not command them.
+# Park 73° and sample 10° are dry-run assumptions, not a measured horn calibration:
+# 10° is design tilt 0° (mouth down) and 73° is design tilt -63°.
+tool:
+  name: Cylinder sampling cover
+  inside_diameter_mm: 110
+  clear_height_mm: 100
+  body_outside_diameter_mm: 112.4
+  flange_outside_diameter_mm: 118
+  wall_thickness_mm: 1.2
+  roof_thickness_mm: 1.6
+  sample_bore_mm: 6.2
+  vent_diameter_mm: 1.8
+  pivot_x_mm: -6
+  pivot_y_mm: 40.5
+  pivot_z_mm: 47
+  tilt_axis: y
+  park_servo_deg: 73
+  sample_servo_deg: 10
+  design_tilt_at_park_deg: -63
+  design_tilt_at_sample_deg: -38
+  angles_calibrated: false
+  approach_clearance_mm: 40
+  seal_standoff_mm: 0
+  assumed_object_diameter_mm: 100
+  assumed_object_height_mm: 80
+  placement_uncertainty_mm: 5
+  dimensions_measured: false
+  descent_tolerance_px: 48
+  # The rim stops at a taught covering pose. This height is unused until it is measured.
+  surface_calibrated: false
+  surface_z_mm: 0
+  mouth_base_deg: 0
+  mouth_shoulder_deg: 0
+  mouth_elbow_deg: 0
+  mouth_wrist_vertical_deg: 0
+  mouth_wrist_rotation_deg: 0
 
 # Taught poses. Gripper angle is filled in by the sequencer (open, calibrated close, or hold).
 # Replace these with poses you jog to on the real arm, then run a dry-run before arming.
@@ -130,39 +171,45 @@ zones:
     x: 170
     y: 110
     reachable: true
-    approach: {base: 125, shoulder: 80, elbow: 100, wrist_vertical: 80, wrist_rotation: 90}
+    approach: {base: 125, shoulder: 130, elbow: 138, wrist_vertical: 40, wrist_rotation: 90}
     grasp: {base: 125, shoulder: 110, elbow: 82, wrist_vertical: 70, wrist_rotation: 90}
+    # Cup already mouth-down. The rim drops straight down to this pose. Reteach it; do not drive the rim into the table.
+    cover: {base: 125, shoulder: 164, elbow: 144, wrist_vertical: 0, wrist_rotation: 90}
     lift: {base: 125, shoulder: 70, elbow: 108, wrist_vertical: 80, wrist_rotation: 90}
   center:
     x: 170
     y: 0
     reachable: true
-    approach: {base: 90, shoulder: 80, elbow: 100, wrist_vertical: 80, wrist_rotation: 90}
+    approach: {base: 90, shoulder: 130, elbow: 138, wrist_vertical: 40, wrist_rotation: 90}
     grasp: {base: 90, shoulder: 112, elbow: 80, wrist_vertical: 68, wrist_rotation: 90}
+    cover: {base: 90, shoulder: 164, elbow: 144, wrist_vertical: 0, wrist_rotation: 90}
     lift: {base: 90, shoulder: 68, elbow: 108, wrist_vertical: 78, wrist_rotation: 90}
   right:
     x: 170
     y: -110
     reachable: true
-    approach: {base: 55, shoulder: 80, elbow: 100, wrist_vertical: 80, wrist_rotation: 90}
+    approach: {base: 55, shoulder: 130, elbow: 138, wrist_vertical: 40, wrist_rotation: 90}
     grasp: {base: 55, shoulder: 110, elbow: 82, wrist_vertical: 70, wrist_rotation: 90}
+    cover: {base: 55, shoulder: 164, elbow: 144, wrist_vertical: 0, wrist_rotation: 90}
     lift: {base: 55, shoulder: 70, elbow: 108, wrist_vertical: 80, wrist_rotation: 90}
   front:
     x: 245
     y: 0
     reachable: true
-    approach: {base: 90, shoulder: 78, elbow: 112, wrist_vertical: 74, wrist_rotation: 90}
+    approach: {base: 90, shoulder: 130, elbow: 138, wrist_vertical: 40, wrist_rotation: 90}
     grasp: {base: 90, shoulder: 108, elbow: 90, wrist_vertical: 72, wrist_rotation: 90}
+    cover: {base: 90, shoulder: 164, elbow: 144, wrist_vertical: 0, wrist_rotation: 90}
     lift: {base: 90, shoulder: 64, elbow: 114, wrist_vertical: 76, wrist_rotation: 90}
   far:
     x: 340
     y: 0
     reachable: false
-    approach: {base: 90, shoulder: 80, elbow: 100, wrist_vertical: 80, wrist_rotation: 90}
+    approach: {base: 90, shoulder: 130, elbow: 138, wrist_vertical: 40, wrist_rotation: 90}
     grasp: {base: 90, shoulder: 112, elbow: 80, wrist_vertical: 68, wrist_rotation: 90}
+    cover: {base: 90, shoulder: 164, elbow: 144, wrist_vertical: 0, wrist_rotation: 90}
     lift: {base: 90, shoulder: 68, elbow: 108, wrist_vertical: 78, wrist_rotation: 90}
 
-# Mock scene. close_angle is the calibrated gripper servo angle for that object (10 open, 73 shut).
+# Mock scene. close_angle is the old jaw angle. It stays readable and is not used by the cover.
 objects:
   orange_fruit:
     label: orange

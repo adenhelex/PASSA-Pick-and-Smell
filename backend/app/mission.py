@@ -1,12 +1,23 @@
-"""Run a planned pick-and-smell sequence. Motion stays inside the controller."""
+"""Run a planned cover-and-sample sequence. Motion stays inside the controller."""
 
 from __future__ import annotations
 
+import math
 import threading
 import time
 import uuid
 
 from app.config import ARM_JOINTS, Config
+from app.cover import (
+    JAW_TOOLS,
+    apply_mouth_offset,
+    cover_still_low,
+    descent_block,
+    descent_gate,
+    jaw_refusal,
+    tilt_reference,
+    vertical_cover_pose,
+)
 from app.enose import ENose
 from app.geometry import aim_from_bbox, classify_table_point, grip_for_bbox
 from app.motion import MotionController
@@ -31,6 +42,7 @@ class Mission:
         self.store = store
         self._lock = threading.RLock()
         self.picked = False
+        self._descent_reason = ""
         self._bound_map: dict = {}
         self._cancel = threading.Event()
         self._clarify = threading.Event()
@@ -50,6 +62,9 @@ class Mission:
         self.timeline: list[dict] = []
         self.record = {"request": "", "selected": None, "completed": []}
         self.last_stop: dict | None = None
+        self.hold_remaining_s: int | None = None
+        self.hold_total_s: float | None = None
+        self.hold_label = ""
         self.error = ""
         self.outcome = ""
         self._seq = 0
@@ -69,6 +84,9 @@ class Mission:
                     "completed": list(self.record["completed"]),
                 },
                 "last_stop": self.last_stop,
+                "hold_remaining_s": self.hold_remaining_s,
+                "hold_total_s": self.hold_total_s,
+                "hold_label": self.hold_label,
                 "error": self.error,
                 "outcome": self.outcome,
                 "running": self._thread is not None and self._thread.is_alive(),
@@ -188,6 +206,8 @@ class Mission:
         with self._lock:
             self.last_stop = payload
             self.clarification = None
+            self.hold_remaining_s = None
+            self.hold_label = ""
             self.status = "stopped"
             self.phase = "stopped"
             self.outcome = "stopped"
@@ -340,7 +360,7 @@ class Mission:
                             closing = plan.get("final_state") or "Mission finished."
                             level = "info"
                         else:
-                            closing = "The pickup was skipped. The arm was parked without grasping."
+                            closing = "The cover was not lowered. The object stays where it was."
                             level = "error"
                         self.timeline.append(
                             {
@@ -358,6 +378,10 @@ class Mission:
 
     def _step(self, step: dict, plan: dict) -> str:
         tool = step["tool"]
+        if tool in JAW_TOOLS or step.get("purpose") == "confirm_pickup":
+            self._phase("blocked")
+            self._log("blocked", "error", jaw_refusal(tool if tool in JAW_TOOLS else "confirm a pickup"))
+            return "abort"
         self._phase_for(tool)
         self._log(self.phase, "action", step["detail"])
         if tool == "scan":
@@ -380,14 +404,16 @@ class Mission:
             return self._locate(step)
         if tool == "approach":
             return self._approach(step)
-        if tool == "grasp":
-            return self._grasp(step)
-        if tool == "lift":
-            return self._lift_bound(step)
+        if tool == "align":
+            return self._align(step)
+        if tool == "lower":
+            return self._lower(step)
         if tool == "sample_odor":
             return self._sample(step)
-        if tool == "place":
-            return self._place(step)
+        if tool == "raise":
+            return self._raise(step)
+        if tool == "tilt":
+            return self._tilt(step)
         if tool == "park":
             return self._park()
         self._log(self.phase, "error", f"{tool} is not available on this arm.")
@@ -404,7 +430,7 @@ class Mission:
         # visits each selected pose, and that last look stays fresh for locate.
         look_at = max(0, len(poses) - 1)
         for index, pose in enumerate(poses):
-            outcome = self._move(pose.angles(), self.cfg.gripper_open, slow=False)
+            outcome = self._move(pose.angles(), self._servo("park"), slow=False)
             if outcome != "ok":
                 return outcome
             self._sync_arm()
@@ -445,7 +471,7 @@ class Mission:
             self._log(
                 "target_found",
                 "error",
-                f"I don't see {step.get('description') or 'that object'} after scanning. I did not command a pickup.",
+                f"I don't see {step.get('description') or 'that object'} after scanning. I did not lower the cover.",
             )
             return "skip"
         self._remember(bound)
@@ -488,13 +514,121 @@ class Mission:
         self._phase("approaching")
         self._refresh_aim(bound)
         if bound.get("aim"):
-            self._log("approaching", "info", f"Following the {bound['name']} and adjusting near, far, left, and right.")
+            self._log("approaching", "info", f"Reaching out over the {bound['name']} with the cup still clear.")
         return self._move(
             self._arm_pose(bound, "approach"),
-            self.cfg.gripper_open,
+            self._servo("park"),
             slow=False,
-            follow=self._aim_follow(bound, "approach"),
+            follow=self._cover_follow(bound, "approach"),
         )
+
+    def _align(self, step: dict) -> str:
+        bound = self._require_bound(step)
+        if bound is None:
+            return "skip"
+        self._phase("aligning")
+        self._refresh_aim(bound)
+        self._log(
+            "aligning",
+            "info",
+            f"Turning the cup so the opening faces straight down over the {bound['name']}. The arm stays put.",
+        )
+        return self._move(
+            self._arm_pose(bound, "align"),
+            self._servo("sample"),
+            slow=False,
+            follow=self._cover_follow(bound, "align"),
+        )
+
+    def _lower(self, step: dict) -> str:
+        bound = self._require_bound(step)
+        if bound is None:
+            return "skip"
+        self._phase("lowering")
+        block, note = descent_gate(self.cfg.tool, self.motion.mode == "armed")
+        if note:
+            self._log("lowering", "info", note)
+        if block:
+            self._log("lowering", "error", block)
+            return "abort"
+        self._refresh_aim(bound)
+        pose, endpoint = self._covering_pose(bound)
+        start = list(bound.get("bbox") or [])
+        live = self._live_object(bound["object_id"])
+        started_uncertain = bool(live is not None and live.uncertain)
+        self._log(
+            "lowering",
+            "action",
+            f"Dropping the cup straight down over the {bound['name']} until the rim reaches the {endpoint}. "
+            f"The opening stays facing down. Its place stays ({bound.get('table_x')}, {bound.get('table_y')}). "
+            "The rim is not pushed into the surface, and servo stall is not used as contact.",
+        )
+        outcome = self._move(
+            pose,
+            self._servo("sample"),
+            slow=True,
+            follow=self._watch_descent(bound, pose, start, started_uncertain),
+        )
+        if self._descent_reason:
+            self._descent_reason = ""
+            self._cancel.clear()
+            self.motion.release_cancel()
+            return "abort"
+        return outcome
+
+    def _raise(self, step: dict) -> str:
+        bound = self._require_bound(step)
+        if bound is None:
+            return "skip"
+        self._phase("retracting")
+        self._log("retracting", "action", f"Raising the cup straight up until it is clear of the {bound['name']}.")
+        return self._move(
+            self._arm_pose(bound, "raise"),
+            self._servo("sample"),
+            slow=True,
+            follow=self._cover_follow(bound, "raise"),
+        )
+
+    def _tilt(self, step: dict) -> str:
+        bound = self._require_bound(step)
+        if bound is None:
+            return "skip"
+        self._phase("retracting")
+        current = self.motion.export()["angles"]
+        if cover_still_low(current, self._arm_pose(bound, "lower"), self._arm_pose(bound, "raise")):
+            self._log(
+                "retracting",
+                "error",
+                "The cover is still near the sampling height. It will not tilt until it has been raised clear of the object.",
+            )
+            return "abort"
+        self._log("retracting", "info", tilt_reference(self.cfg.tool))
+        if any(current.get(name) is None for name in ARM_JOINTS):
+            self._log("retracting", "error", "Joint angles are unknown, so the cover will not tilt.")
+            return "abort"
+        arm = {name: float(current[name]) for name in ARM_JOINTS}
+        return self._move(arm, self._servo("park"), slow=True)
+
+    def _watch_descent(self, bound: dict, pose: dict, start_bbox: list, started_uncertain: bool):
+        tolerance = float(self.cfg.tool.descent_tolerance_px)
+
+        def current() -> dict:
+            live = self._live_object(bound["object_id"])
+            uncertain = bool(live is not None and getattr(live, "uncertain", False) and not started_uncertain)
+            live_box = None if live is None else getattr(live, "bbox", None)
+            reason = descent_block(start_bbox, live_box, tolerance, uncertain)
+            if reason and not self._descent_reason:
+                self._descent_reason = reason
+                self._log("lowering", "error", reason)
+                self._cancel.set()
+            return pose
+
+        return current
+
+    def _servo(self, kind: str) -> float:
+        if kind == "sample":
+            return float(self.cfg.tool.sample_servo_deg)
+        return float(self.cfg.tool.park_servo_deg)
 
     def _grasp(self, step: dict) -> str:
         bound = self._require_bound(step)
@@ -634,18 +768,36 @@ class Mission:
         if bound is None:
             return "skip"
         self._phase("sampling")
-        # Stay in the lift fold. The old sample pose opens the elbow and points the arm at the sky.
-        self._log("sampling", "action", f"Holding the {bound['name']} and reading the smell. The arm stays folded.")
+        placed = self._sampling_position_problem(bound)
+        if placed:
+            self._log("sampling", "error", placed)
+            return "abort"
+        seconds = float(self.cfg.sample_hold_s)
+        simulated = self.enose.mode == "mock" or self.motion.mode != "armed"
+        label = "Simulated sampling" if simulated else "Sampling"
+        self._log(
+            "sampling",
+            "action",
+            f"{label} for {seconds:g} s over the {bound['name']}. "
+            "The timer starts now that the cover is at the covering pose. "
+            "The arm and cover tilt stay still. "
+            + (
+                "This is not a real odor measurement. The object stays on the surface."
+                if simulated
+                else "The object stays on the surface."
+            ),
+        )
         if not self._hold():
+            self._log("sampling", "error", "Stop cancelled the cover hold. The arm stays where it is.")
             return "stop"
         if self.enose.mode == "unavailable":
-            failed = self.enose.baseline(self._cancel)
+            failed = self.enose.baseline(self._cancel, immediate=True)
             self._log("sampling", "error", failed["detail"])
             return "ok"
         stages = (
-            ("baseline", lambda: self.enose.baseline(self._cancel)),
-            ("sample", lambda: self.enose.sample(bound["object_id"], bound["name"], self._cancel)),
-            ("purge", lambda: self.enose.purge(self._cancel)),
+            ("baseline", lambda: self.enose.baseline(self._cancel, immediate=True)),
+            ("sample", lambda: self.enose.sample(bound["object_id"], bound["name"], self._cancel, immediate=True)),
+            ("purge", lambda: self.enose.purge(self._cancel, immediate=True)),
         )
         for stage, read in stages:
             if self._cancel.is_set():
@@ -654,7 +806,10 @@ class Mission:
             if self._cancel.is_set():
                 return "stop"
             level = "observation" if reading.get("ok") else "error"
-            self._log("sampling", level, reading["detail"])
+            message = reading["detail"]
+            if stage == "purge":
+                message = f"Purge after the {bound['name']}. {reading['detail']}"
+            self._log("sampling", level, message)
             if stage == "sample" and reading.get("ok"):
                 self._save_smell(bound, reading)
             if not reading.get("ok"):
@@ -760,11 +915,24 @@ class Mission:
 
     def _park(self) -> str:
         holding = [track for track in self.vision.tracks.values() if track.held]
-        gripper = holding[0].spec.close_angle if holding else self.cfg.gripper_open
-        outcome = self._move(self.cfg.park.angles(), gripper, slow=False)
         if holding:
-            self._log("complete", "info", f"Parked while still holding the {holding[0].spec.name}.")
-        return outcome
+            self._log(
+                "complete",
+                "info",
+                f"The {holding[0].spec.name} is marked held from an older jaw run. Cylinder mode will not carry it.",
+            )
+        return self._move(self.cfg.park.angles(), self._servo("park"), slow=False)
+
+    def _sampling_position_problem(self, bound: dict) -> str | None:
+        angles = self.motion.export()["angles"]
+        servo = angles.get("gripper")
+        if servo is None or abs(float(servo) - self._servo("sample")) > 3:
+            return "The cover is not at the sampling tilt, so odor sampling did not start."
+        lowered = self._arm_pose(bound, "lower")
+        for joint in ("shoulder", "elbow"):
+            if angles.get(joint) is None or abs(float(angles[joint]) - float(lowered[joint])) > 8:
+                return "The cover is not at the sampling position, so odor sampling did not start."
+        return None
 
     def _park_if_safe(self) -> None:
         robot = self.motion.export()
@@ -781,6 +949,8 @@ class Mission:
             self.vision.invalidate("The arm moved, so the last camera observation is stale.")
             self._sync_arm()
         if result.interrupted or self._cancel.is_set():
+            if self._descent_reason:
+                return "abort"
             self._log("stopped", "error", result.detail or "Stopped.")
             return "stop"
         if result.uncertain:
@@ -793,12 +963,29 @@ class Mission:
         return "ok"
 
     def _hold(self) -> bool:
-        deadline = time.time() + self.cfg.sample_hold_s
-        while time.time() < deadline:
-            if self._cancel.is_set():
-                return False
-            time.sleep(0.02)
-        return True
+        """Cover dwell. The motion controller owns the timer, and Stop ends it."""
+        total = max(0.0, float(self.cfg.sample_hold_s))
+        simulated = self.enose.mode == "mock" or self.motion.mode != "armed"
+
+        def tick(remaining: float) -> None:
+            shown = int(math.ceil(remaining - 1e-9))
+            with self._lock:
+                self.hold_total_s = total
+                self.hold_remaining_s = shown
+                self.hold_label = "Simulated sampling" if simulated else "Sampling"
+            self._touch()
+
+        with self._lock:
+            self.hold_total_s = total
+            self.hold_remaining_s = int(math.ceil(total - 1e-9)) if total else 0
+            self.hold_label = "Simulated sampling" if simulated else "Sampling"
+        self._touch()
+        finished = self.motion.wait_still(total, tick)
+        with self._lock:
+            self.hold_remaining_s = None
+            self.hold_label = ""
+        self._touch()
+        return finished
 
     def _resolve_live(self, step: dict) -> dict | None:
         object_id = step.get("object_id")
@@ -878,6 +1065,23 @@ class Mission:
         if self.cfg.objects.get(bound["object_id"]) is None:
             bound["close_angle"] = grip_for_bbox(live.bbox, self.cfg)
 
+    def _cover_follow(self, bound: dict, kind: str):
+        """Dry-run moves the joints together, so the cup turns and then drops straight down."""
+
+        def current() -> dict:
+            if bound.get("aim"):
+                self._refresh_aim(bound)
+            return self._arm_pose(bound, kind)
+
+        return current
+
+    def _heading(self, bound: dict) -> float:
+        aim = bound.get("aim") or {}
+        aimed = aim.get("approach") or aim.get("grasp")
+        if aimed and "base" in aimed:
+            return float(aimed["base"])
+        return float(self.cfg.zones[bound["zone"]].approach.base)
+
     def _aim_follow(self, bound: dict, kind: str):
         if not bound.get("aim"):
             return None
@@ -893,12 +1097,28 @@ class Mission:
 
         return current
 
+    def _covering_pose(self, bound: dict) -> tuple[dict, str]:
+        """Rim endpoint of the straight drop. The opening is already facing down."""
+        pose = apply_mouth_offset(vertical_cover_pose(self._heading(bound), low=True), self.cfg)
+        if self.cfg.tool.surface_calibrated:
+            return pose, (
+                f"vertical covering pose for the calibrated surface at {self.cfg.tool.surface_z_mm:g} mm"
+            )
+        return pose, "vertical covering pose. Surface height is not calibrated"
+
     def _arm_pose(self, bound: dict, kind: str) -> dict:
+        if kind in {"approach", "align", "raise", "lower"}:
+            return apply_mouth_offset(vertical_cover_pose(self._heading(bound), low=kind == "lower"), self.cfg)
+        source = {"align": "approach", "raise": "approach"}.get(kind, kind)
         aim = bound.get("aim") or {}
-        if kind in aim:
-            return aim[kind]
-        zone = self.cfg.zones[bound["zone"]]
-        return getattr(zone, kind).angles()
+        if source in aim:
+            pose = dict(aim[source])
+        else:
+            zone = self.cfg.zones[bound["zone"]]
+            pose = getattr(zone, source).angles()
+        if kind in {"approach", "align", "lower", "raise"}:
+            return apply_mouth_offset(pose, self.cfg)
+        return pose
 
     def _live_object(self, object_id: str):
         for item in self.vision.observations:
@@ -948,10 +1168,11 @@ class Mission:
             "report_scene": "scanning",
             "locate": "target_found",
             "approach": "approaching",
-            "grasp": "grasping",
-            "lift": "grasping",
+            "align": "aligning",
+            "lower": "lowering",
             "sample_odor": "sampling",
-            "place": "placing",
+            "raise": "retracting",
+            "tilt": "retracting",
             "park": "complete",
         }
         self._phase(mapping.get(tool, self.phase))
@@ -996,7 +1217,7 @@ def _describe(items) -> str:
         if item.uncertain:
             bits.append(f"{item.name} (uncertain)")
         elif item.held:
-            bits.append(f"{item.name} with the gripper")
+            bits.append(f"{item.name} is marked held from an older jaw run and was not moved")
         elif item.zone:
             bits.append(f"{item.name} at {item.zone}")
         else:

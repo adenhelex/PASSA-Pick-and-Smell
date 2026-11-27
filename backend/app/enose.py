@@ -76,11 +76,12 @@ class ENose:
             "detail": detail,
         }
 
-    def baseline(self, cancel) -> dict:
+    def baseline(self, cancel, immediate: bool = False) -> dict:
         if self.mode == "unavailable":
             return self._unavailable()
         if self.mode == "mock":
-            self._wait(cancel)
+            if not immediate:
+                self._wait(cancel)
             return {
                 "ok": True,
                 "source": "mock",
@@ -90,11 +91,12 @@ class ENose:
             }
         return self._hardware("baseline", {})
 
-    def sample(self, object_id: str, object_name: str, cancel) -> dict:
+    def sample(self, object_id: str, object_name: str, cancel, immediate: bool = False) -> dict:
         if self.mode == "unavailable":
             return self._unavailable()
         if self.mode == "mock":
-            self._wait(cancel)
+            if not immediate:
+                self._wait(cancel)
             channels = eight_channels(PATTERNS.get(object_id, [1.1, 1.0, 0.9, 1.2, 1.0, 1.0, 1.0, 1.0]))
             text = ", ".join(f"R{index} {value:.2f}" for index, value in enumerate(channels or []))
             return {
@@ -109,11 +111,12 @@ class ENose:
             }
         return self._hardware("sample", {"object": object_name})
 
-    def purge(self, cancel) -> dict:
+    def purge(self, cancel, immediate: bool = False) -> dict:
         if self.mode == "unavailable":
             return self._unavailable()
         if self.mode == "mock":
-            self._wait(cancel)
+            if not immediate:
+                self._wait(cancel)
             return {
                 "ok": True,
                 "source": "mock",

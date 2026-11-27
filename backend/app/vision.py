@@ -104,6 +104,11 @@ class Vision:
         self.observation_stale = True
         self.stale_reason = "No observation yet."
         self.video_error = ""
+        self.describe_status = ""
+        self._described: list[tuple[list[int], str, str]] = []
+        self._described_at = 0.0
+        self._describe_started = 0.0
+        self._describe_busy = False
         self.arm_pose = dict(cfg.park.angles())
         self._jpeg = b""
         self._hardware_jpeg = b""
@@ -208,6 +213,7 @@ class Vision:
                 "seen": self.seen,
                 "items": [item.as_dict() for item in self.observations],
                 "video_error": self.video_error,
+                "describe_status": self.describe_status,
             }
 
     def jpeg(self) -> bytes:
@@ -279,6 +285,8 @@ class Vision:
             observations = self._mock_observations()
         with self._lock:
             if self.mode == "hardware":
+                if self.cfg.vlm_enabled:
+                    self._paint_descriptions(observations)
                 observations = self._assign_ids(observations)
             self.observations = self._keep_manual(observations)
             self.seen = _format_seen(observations, self._reply if self.mode == "hardware" else "")
@@ -289,6 +297,11 @@ class Vision:
         if self.mode != "hardware":
             self._render(force_obs=False)
         self.on_change()
+        if self.mode == "hardware" and self.cfg.vlm_enabled and observations:
+            with self._lock:
+                frame = self._hardware_jpeg
+            if frame:
+                self._schedule_describe(frame, observations)
         return observations
 
     def _look_is_fresh(self) -> bool:
@@ -839,6 +852,8 @@ class Vision:
                 return
             if found is not None:
                 self._apply_detections(found)
+                if self.cfg.vlm_enabled:
+                    self._schedule_describe(frame, found)
                 try:
                     preview = self._decorate(frame)
                 except Exception:
@@ -853,6 +868,8 @@ class Vision:
 
     def _apply_detections(self, items: list[Observation]) -> None:
         with self._lock:
+            if self.cfg.vlm_enabled:
+                self._paint_descriptions(items)
             self.observations = self._keep_manual(self._assign_ids(items))
             self.seen = _format_seen(self.observations, "")
             self.observation_ts = time.time()
@@ -860,6 +877,152 @@ class Vision:
             self.stale_reason = ""
             if not self.frame_id:
                 self.frame_id = uuid.uuid4().hex[:8]
+
+    def clear_descriptions(self) -> None:
+        """Drop vision-model phrases and show the detector name again."""
+        with self._lock:
+            self._described = []
+            self._described_at = 0.0
+            self.describe_status = ""
+            for item in self.observations:
+                if item.source != "camera" or not item.label:
+                    continue
+                item.name = f"{item.color} {item.label}".strip()
+                item.attributes = [item.label]
+            self.seen = _format_seen(self.observations, "")
+        self.on_change()
+
+    def _schedule_describe(self, frame: bytes, items: list[Observation]) -> None:
+        """Ask the vision model about the current boxes without stopping detection."""
+        if not self.cfg.vlm_enabled or not frame or not items:
+            return
+        ranked = _describe_targets(items)
+        now = time.time()
+        with self._lock:
+            if self._describe_busy or now - self._describe_started < 4:
+                return
+            covered = now - self._described_at < 8 and _descriptions_cover(self._described, ranked)
+            if covered:
+                return
+            self._describe_busy = True
+            self._describe_started = now
+            snapshot = list(ranked)
+        threading.Thread(
+            target=self._describe_worker,
+            args=(frame, snapshot),
+            name="vlm-describe",
+            daemon=True,
+        ).start()
+
+    def _describe_worker(self, frame: bytes, items: list[Observation]) -> None:
+        try:
+            if not self.cfg.vlm_enabled:
+                return
+            self.describe_status = "Describing the detected objects…"
+            self.on_change()
+            described: list[tuple[list[int], str, str]] = []
+            total = len(items)
+            for index, item in enumerate(items, start=1):
+                if not self.cfg.vlm_enabled:
+                    return
+                self.describe_status = f"Describing object {index} of {total}…"
+                self.on_change()
+                try:
+                    prompt, image = _crop_prompt(frame, item)
+                    reply = self._vlm_chat(prompt, image, predict=80, timeout=30)
+                except Exception as exc:
+                    self.describe_status = f"Vision description failed: {exc}"[:180]
+                    self.on_change()
+                    continue
+                parsed = _parse_descriptions(reply, 1)
+                if not self.cfg.vlm_enabled or parsed[0] is None:
+                    continue
+                name, detail = parsed[0]
+                described.append((list(item.bbox), name, detail))
+                with self._lock:
+                    if not self.cfg.vlm_enabled:
+                        return
+                    self._remember_description(item.bbox, name, detail)
+                    self._described_at = time.time()
+                    self._paint_descriptions(self.observations)
+                    self.seen = _format_seen(self.observations, "")
+                self.on_change()
+            with self._lock:
+                if not self.cfg.vlm_enabled:
+                    return
+                self.describe_status = "" if described else "The vision model did not describe the objects."
+            self.on_change()
+        except Exception as exc:
+            self.describe_status = f"Vision description failed: {exc}"[:180]
+            self.on_change()
+        finally:
+            with self._lock:
+                self._describe_busy = False
+
+    def _remember_description(self, bbox: list[int], name: str, detail: str) -> None:
+        """Keep one phrase per object. Caller holds the lock."""
+        kept = [
+            (box, old_name, old_detail)
+            for box, old_name, old_detail in self._described
+            if _iou(bbox, box) <= 0.5
+        ]
+        kept.append((list(bbox), name, detail))
+        self._described = kept
+
+    def _paint_descriptions(self, items: list[Observation]) -> None:
+        """Copy a cached description onto the box it still overlaps. Caller holds the lock."""
+        used: list[str] = []
+        for item in items:
+            hit = _match_description(item.bbox, self._described)
+            if hit is None:
+                continue
+            name, detail = hit
+            if any(name.lower() == other.lower() for other in used):
+                name = f"{name} {len(used) + 1}"
+            used.append(name)
+            item.name = name
+            item.attributes = [item.label, detail] if detail else [item.label]
+
+    def _vlm_chat(self, prompt: str, image: bytes, predict: int = 400, timeout: float | None = None) -> str:
+        import base64
+
+        encoded = base64.b64encode(image).decode()
+        base = self.cfg.vlm_base_url.rstrip("/")
+        if self.cfg.vlm_api == "ollama":
+            response = httpx.post(
+                base + "/api/chat",
+                json={
+                    "model": self.cfg.vlm_model,
+                    "stream": False,
+                    "think": False,
+                    "format": "json",
+                    "keep_alive": "30m",
+                    "options": {"temperature": 0, "num_predict": predict, "num_ctx": 4096},
+                    "messages": [{"role": "user", "content": prompt, "images": [encoded]}],
+                },
+                timeout=self.cfg.vlm_timeout_s if timeout is None else timeout,
+            )
+            response.raise_for_status()
+            return response.json()["message"]["content"]
+        response = httpx.post(
+            base + "/v1/chat/completions",
+            json={
+                "model": self.cfg.vlm_model,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{encoded}"}},
+                        ],
+                    }
+                ],
+                "temperature": 0,
+            },
+            timeout=self.cfg.vlm_timeout_s if timeout is None else timeout,
+        )
+        response.raise_for_status()
+        return response.json()["choices"][0]["message"]["content"]
 
     def _assign_ids(self, items: list[Observation]) -> list[Observation]:
         """Keep the same id while an object moves, so a click still means that object."""
@@ -1093,6 +1256,84 @@ def _box_around(image: Image.Image, u: float, v: float) -> list[int]:
     return [x0 + min_x, y0 + min_y, max(8, max_x - min_x + 1), max(8, max_y - min_y + 1)]
 
 
+def _describe_targets(items: list[Observation]) -> list[Observation]:
+    return sorted(items, key=lambda item: item.confidence, reverse=True)
+
+
+def _descriptions_cover(described: list[tuple[list[int], str, str]], items: list[Observation]) -> bool:
+    return all(_match_description(item.bbox, described) is not None for item in items)
+
+
+def _match_description(bbox: list[int], described: list[tuple[list[int], str, str]]) -> tuple[str, str] | None:
+    best = 0.3
+    found: tuple[str, str] | None = None
+    for box, name, detail in described:
+        score = _iou(bbox, box)
+        if score > best:
+            best = score
+            found = (name, detail)
+    return found
+
+
+def _crop_prompt(jpeg: bytes, item: Observation) -> tuple[str, bytes]:
+    """A close-up of one box. The model names that object instead of the whole photo."""
+    image = Image.open(io.BytesIO(jpeg)).convert("RGB")
+    if image.size != (WIDTH, HEIGHT):
+        image = image.resize((WIDTH, HEIGHT))
+    x, y, w, h = [int(value) for value in item.bbox]
+    pad_x = max(16, int(w * 0.25))
+    pad_y = max(16, int(h * 0.25))
+    x0 = max(0, x - pad_x)
+    y0 = max(0, y - pad_y)
+    x1 = min(image.width, x + w + pad_x)
+    y1 = min(image.height, y + h + pad_y)
+    crop = image.crop((x0, y0, max(x0 + 8, x1), max(y0 + 8, y1)))
+    if max(crop.size) < 192:
+        scale = 192 / max(crop.size)
+        crop = crop.resize((max(8, int(crop.width * scale)), max(8, int(crop.height * scale))), Image.Resampling.BILINEAR)
+    crop.thumbnail((384, 384), Image.Resampling.BILINEAR)
+    buffer = io.BytesIO()
+    crop.save(buffer, format="JPEG", quality=90)
+    prompt = (
+        "This picture is a close-up of one object. "
+        f"A detector guessed {item.label}, and that guess can be wrong. "
+        "Name only the object that fills this close-up. Ignore the table and the background. "
+        'Return JSON {"items":[{"n":1,"name":"","detail":""}]}. '
+        "Put the real words in name and detail. name is 2 to 5 words. detail is one short sentence."
+    )
+    return prompt, buffer.getvalue()
+
+
+def _parse_descriptions(reply: str, count: int) -> list[tuple[str, str] | None]:
+    parsed = _extract_json(reply or "")
+    rows = parsed.get("items") or parsed.get("descriptions") or parsed.get("observations") or []
+    found: list[tuple[str, str] | None] = [None] * count
+    if not isinstance(rows, list):
+        return found
+    for raw in rows:
+        if not isinstance(raw, dict):
+            continue
+        try:
+            index = int(raw.get("n") or raw.get("index") or raw.get("number")) - 1
+        except (TypeError, ValueError):
+            continue
+        if not 0 <= index < count or found[index] is not None:
+            continue
+        name = _clean_phrase(raw.get("name") or raw.get("label") or "", 48)
+        detail = _clean_phrase(raw.get("detail") or raw.get("description") or "", 140)
+        if name:
+            found[index] = (name, detail)
+    return found
+
+
+def _clean_phrase(value, limit: int) -> str:
+    text = " ".join(str(value or "").replace("\n", " ").split())
+    text = text.strip(" \"'`.,;:")
+    if not text or text.isdigit() or text.lower() in {"object", "item", "unknown", "none"}:
+        return ""
+    return text[:limit].rstrip()
+
+
 def _center(bbox: list[int]) -> tuple[float, float]:
     return bbox[0] + bbox[2] / 2, bbox[1] + bbox[3] / 2
 
@@ -1259,35 +1500,13 @@ def _bbox_pixels(raw, width: int, height: int) -> list[int]:
     return [int(round(x)), int(round(y)), int(round(w)), int(round(h))]
 
 
-_BACKGROUND_LABELS = {
-    "sink",
-    "dining table",
-    "table",
-    "bed",
-    "couch",
-    "sofa",
-    "tv",
-    "laptop",
-    "keyboard",
-    "refrigerator",
-    "oven",
-    "toilet",
-    "person",
-    "chair",
-}
-
-
 def _ungraspable_detection(label: str, bbox: list[float] | tuple[float, ...]) -> bool:
-    """Drop background classes and huge boxes the arm cannot pick up."""
-    kind = (label or "").strip().lower()
-    if kind in _BACKGROUND_LABELS:
-        return True
+    """Drop an empty box and a box that fills the photo. Every other object stays."""
     box = list(bbox or []) + [0, 0, 0, 0]
     w, h = float(box[2]), float(box[3])
     if w <= 0 or h <= 0:
         return True
-    # Same threshold as the twin: giant scene boxes are furniture, not targets.
-    if (w * h) / (WIDTH * HEIGHT) > 0.2:
+    if (w * h) / (WIDTH * HEIGHT) > 0.92:
         return True
     return False
 

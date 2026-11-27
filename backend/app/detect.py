@@ -64,7 +64,52 @@ CLASSES = (
     "chair",
     "couch",
     "sink",
+    "lemon",
+    "lime",
+    "fruit",
+    "tomato",
+    "egg",
+    "onion",
+    "potato",
+    "bread",
+    "snack",
+    "ball",
+    "toy",
+    "block",
+    "cube",
+    "headphones",
+    "earphones",
+    "speaker",
+    "cable",
+    "charger",
+    "battery",
+    "adapter",
+    "camera",
+    "tape",
+    "cloth",
+    "napkin",
+    "food",
+    "tool",
+    "screwdriver",
+    "robot arm",
 )
+
+# A container name loses to a specific object on the same pixels.
+# A mouse covered by a bottle box stays a mouse.
+GENERIC = {
+    "bottle",
+    "water bottle",
+    "cup",
+    "mug",
+    "bowl",
+    "jar",
+    "can",
+    "box",
+    "plate",
+    "lid",
+    "cap",
+    "vase",
+}
 
 # The table is the surface under the objects, not something to pick.
 SKIP = {"dining table"}
@@ -88,7 +133,7 @@ class Detection:
     confidence: float
 
 
-def detect_objects(image: Image.Image, conf: float = 0.08, iou: float = 0.45) -> list[Detection]:
+def detect_objects(image: Image.Image, conf: float = 0.08, iou: float = 0.65) -> list[Detection]:
     session = _model()
     canvas, scale, pad_x, pad_y = _letterbox(image, INPUT_SIZE)
     blob = np.asarray(canvas, dtype=np.float32) / 255.0
@@ -150,7 +195,8 @@ def _decode(output, scale: float, pad_x: float, pad_y: float, width: int, height
     xyxy[:, [1, 3]] = np.clip(xyxy[:, [1, 3]], 0, max(0, height - 1))
     order = _nms(xyxy, class_scores, class_ids, iou)
     found: list[Detection] = []
-    area_limit = width * height * 0.7
+    # Only the surface that fills the photo is dropped. A large object stays.
+    area_limit = width * height * 0.92
     for index in order:
         label = CLASSES[int(class_ids[index])]
         if label in SKIP:
@@ -180,7 +226,6 @@ def _nms(boxes, scores, class_ids, iou: float) -> list[int]:
         if order.size == 1:
             break
         rest = order[1:]
-        same = class_ids[rest] == class_ids[current]
         xx1 = np.maximum(boxes[current, 0], boxes[rest, 0])
         yy1 = np.maximum(boxes[current, 1], boxes[rest, 1])
         xx2 = np.minimum(boxes[current, 2], boxes[rest, 2])
@@ -189,6 +234,13 @@ def _nms(boxes, scores, class_ids, iou: float) -> list[int]:
         area_c = max(0, boxes[current, 2] - boxes[current, 0]) * max(0, boxes[current, 3] - boxes[current, 1])
         area_r = np.maximum(0, boxes[rest, 2] - boxes[rest, 0]) * np.maximum(0, boxes[rest, 3] - boxes[rest, 1])
         overlap = inter / (area_c + area_r - inter + 1e-6)
-        drop = same & (overlap > iou)
+        crowded = overlap > iou
+        current_generic = CLASSES[int(class_ids[current])] in GENERIC
+        rest_generic = np.array([CLASSES[int(class_ids[index])] in GENERIC for index in rest])
+        # The higher score is usually a bottle on top of the real object. Keep the real one.
+        specific_wins = crowded & current_generic & ~rest_generic
+        if np.any(specific_wins):
+            kept.pop()
+        drop = crowded & ~specific_wins
         order = rest[~drop]
     return kept

@@ -91,7 +91,8 @@ def create_app(config: Config | None = None) -> FastAPI:
     def update_settings(body: SettingsIn):
         data = body.model_dump(exclude_none=True)
         offset_only = bool(data) and set(data) <= {"aim_offset_x", "aim_offset_y", "aim_offset_z"}
-        if not offset_only:
+        vision_only = bool(data) and set(data) <= {"vlm_enabled"}
+        if not offset_only and not vision_only:
             _require_idle()
         if "serial_mode" in data:
             if data["serial_mode"] not in {"mock", "hardware"}:
@@ -116,6 +117,8 @@ def create_app(config: Config | None = None) -> FastAPI:
             ctx.cfg.llm_model = data["llm_model"].strip()
         if "vlm_enabled" in data:
             ctx.cfg.vlm_enabled = bool(data["vlm_enabled"])
+            if not ctx.cfg.vlm_enabled:
+                ctx.vision.clear_descriptions()
         if "vlm_base_url" in data:
             ctx.cfg.vlm_base_url = data["vlm_base_url"].rstrip("/")
         if "vlm_model" in data:
@@ -132,7 +135,16 @@ def create_app(config: Config | None = None) -> FastAPI:
         for axis, field in (("x", "aim_offset_x"), ("y", "aim_offset_y"), ("z", "aim_offset_z")):
             if field in data:
                 setattr(ctx.cfg, field, max(0.5, min(4.0, float(data[field]))))
-        if not offset_only:
+        if "cover_park_deg" in data or "cover_sample_deg" in data:
+            lo, hi = ctx.cfg.joint_limits["gripper"]
+            if "cover_park_deg" in data:
+                ctx.cfg.tool.park_servo_deg = max(lo, min(hi, float(data["cover_park_deg"])))
+            if "cover_sample_deg" in data:
+                ctx.cfg.tool.sample_servo_deg = max(lo, min(hi, float(data["cover_sample_deg"])))
+            ctx.cfg.tool.angles_calibrated = False
+        if "sample_hold_s" in data:
+            ctx.cfg.sample_hold_s = max(1.0, min(120.0, float(data["sample_hold_s"])))
+        if not offset_only and not vision_only:
             ctx.mission.note_settings_changed()
         ctx.publish()
         return ctx.snapshot()
@@ -333,6 +345,9 @@ class SettingsIn(BaseModel):
     aim_offset_x: float | None = None
     aim_offset_y: float | None = None
     aim_offset_z: float | None = None
+    cover_park_deg: float | None = None
+    cover_sample_deg: float | None = None
+    sample_hold_s: float | None = None
 
 
 class GripperIn(BaseModel):

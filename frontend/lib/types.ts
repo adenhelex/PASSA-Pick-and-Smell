@@ -17,6 +17,8 @@ export interface ObservationItem {
   source: string;
   localization_note: string;
   color: string;
+  label?: string;
+  attributes?: string[];
 }
 
 export interface PlanStep {
@@ -53,6 +55,7 @@ export interface ArmState {
     stale_reason: string;
     video_stale: boolean;
     video_error: string;
+    describe_status?: string;
     selected_id: string | null;
     seen?: string;
     observation_ts?: number;
@@ -90,6 +93,9 @@ export interface ArmState {
       acknowledged: boolean;
       detail: string;
     };
+    hold_remaining_s: number | null;
+    hold_total_s: number | null;
+    hold_label: string;
     error: string;
     outcome: string;
     running: boolean;
@@ -112,6 +118,20 @@ export interface ArmState {
     aim_offset_x?: number;
     aim_offset_y?: number;
     aim_offset_z?: number;
+    sample_hold_s?: number;
+    tool?: {
+      name: string;
+      park_servo_deg: number;
+      sample_servo_deg: number;
+      design_tilt_at_park_deg?: number;
+      design_tilt_at_sample_deg?: number;
+      angles_calibrated: boolean;
+      dimensions_measured: boolean;
+      assumption: string;
+      descent_block: string;
+      inside_diameter_mm: number;
+      clear_height_mm: number;
+    };
   };
 }
 
@@ -139,7 +159,7 @@ export const JOINTS: Array<{ key: JointName; label: string }> = [
   { key: "elbow", label: "Elbow" },
   { key: "wrist_vertical", label: "Wrist vertical" },
   { key: "wrist_rotation", label: "Wrist rotation" },
-  { key: "gripper", label: "Gripper" },
+  { key: "gripper", label: "Cover tilt" },
 ];
 
 export const BACKEND = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://127.0.0.1:8000";

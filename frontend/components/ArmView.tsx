@@ -56,8 +56,7 @@ type ArmParts = {
   elbow: THREE.Object3D;
   wristPitch: THREE.Object3D;
   wristRoll: THREE.Object3D;
-  leftGripper: THREE.Object3D;
-  rightGripper: THREE.Object3D;
+  coverPivot: THREE.Object3D;
   tip: THREE.Object3D;
 };
 
@@ -83,7 +82,7 @@ function objectKind(name: string) {
 function tableTwin(item: ObservationItem) {
   if (item.bbox.length >= 4) {
     const [u, v, w, h] = item.bbox;
-    if ((w * h) / (640 * 480) <= 0.2) {
+    if ((w * h) / (640 * 480) <= 0.92) {
       const across = clamp((u + w / 2) / 640, 0, 1);
       const depth = 1 - clamp((v + h / 2) / 480, 0, 1);
       const forward = WORK_X.min + depth * (WORK_X.max - WORK_X.min);
@@ -108,17 +107,25 @@ function rad(deg: number) {
 }
 
 /** ros_braccio_urdf servo mapping — Begin() looks like the reference photo. */
-function applyBraccioPose(parts: ArmParts, angles: Record<JointName, number>) {
+function applyBraccioPose(
+  parts: ArmParts,
+  angles: Record<JointName, number>,
+  cover: { park: number; sample: number; parkTilt?: number; sampleTilt?: number } = { park: 73, sample: 10 },
+) {
   // Base 90 faces straight onto the table. A lower angle turns toward image-left.
   parts.base.rotation.z = -rad(angles.base);
   parts.shoulder.rotation.x = rad(angles.shoulder);
   parts.elbow.rotation.x = rad(angles.elbow);
   parts.wristPitch.rotation.x = rad(angles.wrist_vertical);
   parts.wristRoll.rotation.z = -rad(angles.wrist_rotation);
-  const open = 1 - clamp((angles.gripper - 10) / 63, 0, 1);
-  const grip = 1.217 + open * (1.5708 - 1.217);
-  parts.rightGripper.rotation.y = -grip;
-  parts.leftGripper.rotation.y = grip;
+  // Dry-run map, same numbers as config/default.yaml. Sample servo levels the
+  // rim on the table. Park servo holds the cup sideways. Not calibrated.
+  const span = cover.sample - cover.park;
+  const share = span === 0 ? 0 : (angles.gripper - cover.park) / span;
+  const parkTilt = cover.parkTilt ?? -63;
+  const sampleTilt = cover.sampleTilt ?? -38;
+  const tilt = parkTilt + share * (sampleTilt - parkTilt);
+  parts.coverPivot.rotation.y = rad(tilt);
 }
 
 async function loadMesh(loader: STLLoader, file: string, color: number) {
@@ -153,23 +160,40 @@ function jointOrigin(parent: THREE.Object3D, xyz: [number, number, number], rpy:
   return joint;
 }
 
+async function loadCoverMesh(loader: STLLoader, file: string, part: "cylinder" | "fixed") {
+  // These files are already in the wrist-mesh design frame, taken from
+  // PASSA Cylindrical Sampling Cover.stl. The wrist triangles stay on the
+  // arm mesh. The cylinder, including its sampling tube, is the rotating part.
+  const geometry = await loader.loadAsync(`${MODEL_ROOT}/${file}`);
+  geometry.computeVertexNormals();
+  const mesh = new THREE.Mesh(
+    geometry,
+    new THREE.MeshStandardMaterial(
+      part === "cylinder"
+        ? { color: 0xd5e6ee, metalness: 0.04, roughness: 0.32, transparent: true, opacity: 0.48, side: THREE.DoubleSide, depthWrite: false }
+        : { color: 0xcfcfcf, metalness: 0.18, roughness: 0.55 },
+    ),
+  );
+  mesh.scale.setScalar(0.001);
+  return mesh;
+}
+
 async function buildBraccioArm(loader: STLLoader): Promise<{ root: THREE.Group; parts: ArmParts }> {
   const orange = 0x913600;
   const white = 0xcfcfcf;
-  const [baseMesh, shoulderMesh, elbowMesh, wristPitchMesh, wristRollMesh, leftGripperMesh, rightGripperMesh] =
-    await Promise.all([
-      loadMesh(loader, "braccio_base.stl", orange),
-      loadMesh(loader, "braccio_shoulder.stl", orange),
-      loadMesh(loader, "braccio_elbow.stl", orange),
-      loadMesh(loader, "braccio_wrist_pitch.stl", orange),
-      loadMesh(loader, "braccio_wrist_roll.stl", white),
-      loadMesh(loader, "braccio_left_gripper.stl", white),
-      loadMesh(loader, "braccio_right_gripper.stl", white),
-    ]);
+  const [baseMesh, shoulderMesh, elbowMesh, wristPitchMesh, wristRollMesh, shroud, bracket] = await Promise.all([
+    loadMesh(loader, "braccio_base.stl", orange),
+    loadMesh(loader, "braccio_shoulder.stl", orange),
+    loadMesh(loader, "braccio_elbow.stl", orange),
+    loadMesh(loader, "braccio_wrist_pitch.stl", orange),
+    loadMesh(loader, "braccio_wrist_roll.stl", white),
+    loadCoverMesh(loader, "cover-cylinder.stl", "cylinder"),
+    loadCoverMesh(loader, "cover-fixed.stl", "fixed"),
+  ]);
 
   // URDF meshes are mm → meters; mount scale maps into the table scene.
   const mm = 0.001;
-  for (const mesh of [baseMesh, shoulderMesh, elbowMesh, wristPitchMesh, wristRollMesh, leftGripperMesh, rightGripperMesh]) {
+  for (const mesh of [baseMesh, shoulderMesh, elbowMesh, wristPitchMesh, wristRollMesh]) {
     mesh.scale.setScalar(mm);
   }
 
@@ -189,11 +213,17 @@ async function buildBraccioArm(loader: STLLoader): Promise<{ root: THREE.Group; 
   const wristRoll = jointOrigin(wristPitch, [0, 0, 0.06], [0, 0, 0]);
   wristRoll.add(makeVisual(wristRollMesh, [0.006, 0, 0], [0, 0, 0]));
 
-  const rightGripper = jointOrigin(wristRoll, [0.01, 0, 0.03], [0, 0, 0]);
-  rightGripper.add(makeVisual(rightGripperMesh, [0, -0.012, 0.01], [0, Math.PI / 2, 0]));
-
-  const leftGripper = jointOrigin(wristRoll, [-0.01, 0, 0.03], [0, Math.PI, 0]);
-  leftGripper.add(makeVisual(leftGripperMesh, [0, -0.012, 0], [0, Math.PI / 2, 0]));
+  // Same visual origin as the wrist mesh. Vertices are already design millimetres.
+  const toolMount = new THREE.Group();
+  toolMount.position.set(0.006, 0, 0);
+  wristRoll.add(toolMount);
+  toolMount.add(bracket);
+  const pivot = new THREE.Vector3(-6 * mm, 40.5 * mm, 47 * mm);
+  const coverPivot = new THREE.Group();
+  coverPivot.position.copy(pivot);
+  toolMount.add(coverPivot);
+  shroud.position.set(-pivot.x, -pivot.y, -pivot.z);
+  coverPivot.add(shroud);
 
   const tip = new THREE.Object3D();
   tip.position.set(0, 0, 0.08);
@@ -201,7 +231,7 @@ async function buildBraccioArm(loader: STLLoader): Promise<{ root: THREE.Group; 
 
   return {
     root,
-    parts: { base, shoulder, elbow, wristPitch, wristRoll, leftGripper, rightGripper, tip },
+    parts: { base, shoulder, elbow, wristPitch, wristRoll, coverPivot, tip },
   };
 }
 
@@ -286,6 +316,7 @@ interface SceneProps {
   selectedId: string | null;
   phase: string;
   showDefaultScene: boolean;
+  cover?: { park: number; sample: number; parkTilt?: number; sampleTilt?: number };
 }
 
 export default function ArmView(props: SceneProps) {
@@ -350,7 +381,7 @@ export default function ArmView(props: SceneProps) {
             shown[joint] = target;
           }
         }
-        applyBraccioPose(parts, shown);
+        applyBraccioPose(parts, shown, current.cover);
       }
 
       const tableSide = TABLE_SIDE_MM * SCALE;
@@ -454,9 +485,9 @@ export default function ArmView(props: SceneProps) {
         parts = next;
         applyBraccioPose(parts, PARK);
         scene.add(mount);
-        status = "";
-        label.textContent = "";
-        label.style.display = "none";
+        status = "Cylinder sampling cover. Fit and servo alignment are not verified.";
+        label.textContent = status;
+        label.style.display = "";
       })
       .catch((error) => {
         status = error instanceof Error ? error.message : "Could not load Braccio meshes.";

@@ -16,6 +16,7 @@ def fast_config() -> Config:
     cfg.sample_hold_s = 0.01
     cfg.motion_timeout_s = 2
     cfg.llm_enabled = False
+    cfg.vlm_enabled = False
     cfg.database_url = "memory"
     return cfg
 
@@ -287,14 +288,20 @@ def test_plan_pick_smell_and_ambiguous_orange():
         answered = client.post("/api/clarify", json={"object_id": "orange_fruit"}).json()
         plan = answered["mission"]["plan"]
         assert [step["tool"] for step in plan["steps"]] == [
+            "scan",
+            "inspect",
+            "locate",
             "approach",
-            "grasp",
-            "lift",
+            "align",
+            "lower",
             "sample_odor",
-            "place",
+            "raise",
+            "tilt",
             "park",
         ]
+        assert "grasp" not in [step["tool"] for step in plan["steps"]]
         assert "front" in plan["final_state"]
+        assert "stays on the" in plan["final_state"]
         assert "mock" in plan["enose_note"].lower()
 
         blue = client.post(
@@ -336,7 +343,8 @@ def test_an_image_target_is_aimed_within_joint_limits():
         client.post("/api/run")
         state = wait_mission(client)
         commands = " ".join(_commands(client))
-        assert "gripper rotate 48" in commands
+        assert "gripper rotate 73" in commands
+        assert "gripper rotate 48" not in commands
         assert state["mission"]["outcome"] != "skipped"
 
 
@@ -353,7 +361,8 @@ def test_mock_cycle_labels_enose_and_missing_enose_is_explicit():
         assert "Mock E-nose" in text
         assert "not a real measurement" in text
         assert "purge" in text.lower()
-        assert "Grab the orange fruit" in text or "Closing the gripper" in text
+        assert "cover" in text.lower()
+        assert "stays on the table" in text.lower()
 
         client.post("/api/settings", json={"enose_mode": "unavailable"})
         client.post("/api/command", json={"text": "Smell the orange fruit."})
@@ -543,7 +552,8 @@ def test_a_click_can_pick_an_object_the_detector_did_not_name():
         plan = chosen["state"]["mission"]["plan"]
         assert plan["status"] == "ready"
         assert "Object" in plan["summary"]
-        assert any(step["tool"] == "grasp" for step in plan["steps"])
+        assert any(step["tool"] == "lower" for step in plan["steps"])
+        assert all(step["tool"] != "grasp" for step in plan["steps"])
 
 
 def test_a_moving_detection_keeps_the_same_identity():
@@ -678,6 +688,31 @@ def test_a_grid_cell_sits_on_the_object_not_the_bottom_edge():
     assert bottom_right[1] > top_left[1]
 
 
+def test_a_real_object_is_kept_when_a_bottle_box_covers_it():
+    import numpy as np
+
+    from app.detect import CLASSES, _nms
+
+    bottle = CLASSES.index("bottle")
+    apple = CLASSES.index("apple")
+    mouse = CLASSES.index("mouse")
+    boxes = np.array([[10, 10, 80, 90], [12, 12, 78, 88], [300, 40, 360, 100]], dtype=float)
+    scores = np.array([0.4, 0.12, 0.5])
+    class_ids = np.array([bottle, apple, mouse])
+    kept = _nms(boxes, scores, class_ids, 0.5)
+    labels = [CLASSES[int(class_ids[index])] for index in kept]
+    assert labels == ["mouse", "apple"]
+
+
+def test_every_object_in_the_frame_is_kept():
+    from app.vision import _ungraspable_detection
+
+    assert not _ungraspable_detection("Chair", [10, 10, 220, 200])
+    assert not _ungraspable_detection("Apple", [400, 30, 28, 28])
+    assert not _ungraspable_detection("Laptop", [20, 20, 400, 300])
+    assert _ungraspable_detection("Table", [0, 0, 640, 480])
+
+
 def test_a_picture_place_puts_the_bottle_on_the_left_and_the_keyboard_on_the_right():
     from app.vision import _cell_bbox, _parse_region
 
@@ -782,13 +817,13 @@ def test_ollama_llava_request_uses_the_native_chat_api(monkeypatch):
     monkeypatch.setattr("httpx.post", fake_post)
     cfg = fast_config()
     assert cfg.vlm_api == "ollama"
-    assert cfg.vlm_model == "llava:latest"
+    assert cfg.vlm_model == "qwen3-vl:8b-instruct"
     from app.vision import Vision
 
     vision = Vision(cfg)
     items = vision._ask_vlm(b"\xff\xd8\xff\xd9")
     assert captured["url"] == "http://127.0.0.1:11434/api/chat"
-    assert captured["json"]["model"] == "llava:latest"
+    assert captured["json"]["model"] == "qwen3-vl:8b-instruct"
     assert captured["json"]["stream"] is False
     assert captured["json"]["messages"][0]["images"]
     assert captured["json"]["think"] is False
@@ -825,14 +860,19 @@ def test_the_local_model_can_choose_the_bottle_the_camera_named(monkeypatch):
     assert adopted.targets[0]["object_id"] == "bottle-1"
     assert adopted.targets[0]["seen"] is True
     assert [step["tool"] for step in adopted.steps] == [
+        "scan",
+        "inspect",
+        "locate",
         "approach",
-        "grasp",
-        "lift",
+        "align",
+        "lower",
         "sample_odor",
-        "place",
+        "raise",
+        "tilt",
         "park",
     ]
-    assert adopted.steps[-2]["destination"] == "original"
+    assert adopted.steps[-2]["tool"] == "tilt"
+    assert "place" not in [step["tool"] for step in adopted.steps]
     assert adopted.steps[0]["object_id"] == "bottle-1"
 
 
@@ -933,15 +973,19 @@ def test_an_echoed_reply_that_names_the_bottle_becomes_a_pick(monkeypatch):
     assert result.question == ""
     assert result.targets[0]["object_id"] == "det-Bottle-1"
     assert [step["tool"] for step in result.steps] == [
+        "scan",
+        "inspect",
+        "locate",
         "approach",
-        "grasp",
-        "lift",
+        "align",
+        "lower",
         "sample_odor",
-        "place",
+        "raise",
+        "tilt",
         "park",
     ]
-    assert result.steps[-2]["destination"] == "original"
-    assert result.summary.startswith("Pick up the green Bottle")
+    assert result.steps[-2]["tool"] == "tilt"
+    assert result.summary.startswith("The green Bottle stays on the table")
 
 
 def test_the_model_can_name_the_bottle_and_its_steps_are_ignored(monkeypatch):
@@ -973,14 +1017,18 @@ def test_the_model_can_name_the_bottle_and_its_steps_are_ignored(monkeypatch):
     assert adopted.status == "ready"
     assert adopted.targets[0]["object_id"] == "det-Bottle-1"
     assert [step["tool"] for step in adopted.steps] == [
+        "scan",
+        "inspect",
+        "locate",
         "approach",
-        "grasp",
-        "lift",
+        "align",
+        "lower",
         "sample_odor",
-        "place",
+        "raise",
+        "tilt",
         "park",
     ]
-    assert adopted.steps[-2]["destination"] == "original"
+    assert adopted.steps[-2]["tool"] == "tilt"
     assert all(step["detail"] != "Pick up the green Bottle." for step in adopted.steps)
 
 
@@ -1126,8 +1174,9 @@ def test_the_model_chooses_the_object_the_word_matcher_would_miss(monkeypatch):
     assert result.planner == "local-llm"
     assert result.targets[0]["object_id"] == "cup-1"
     assert "clear Cup" in result.summary
-    assert [step["tool"] for step in result.steps][0] == "approach"
-    assert "grasp" in [step["tool"] for step in result.steps]
+    assert [step["tool"] for step in result.steps][0] == "scan"
+    assert "lower" in [step["tool"] for step in result.steps]
+    assert "grasp" not in [step["tool"] for step in result.steps]
     assert [step["tool"] for step in result.steps][-1] == "park"
 
 
@@ -1482,6 +1531,120 @@ def test_a_fresh_look_uses_the_detector_box_and_does_not_ask_again(monkeypatch):
     assert calls["n"] == 2
     vision.capture("confirm")
     assert calls["n"] == 3
+
+
+def test_the_vision_model_describes_the_yolo_box_and_does_not_add_one():
+    import io
+
+    from PIL import Image
+
+    from app.vision import Observation, Vision
+
+    def bottle(name="clear Bottle"):
+        return Observation(
+            id="temp",
+            label="Bottle",
+            kind="Bottle",
+            color="clear",
+            name=name,
+            bbox=[118, 150, 46, 120],
+            confidence=0.91,
+            uncertain=False,
+            attributes=["Bottle"],
+            table_x=None,
+            table_y=None,
+            zone=None,
+            localizable=False,
+            localization_note="",
+            source="camera",
+            held=False,
+            frame_id="",
+        )
+
+    frame = io.BytesIO()
+    Image.new("RGB", (640, 480), (210, 220, 215)).save(frame, format="JPEG")
+    vision = Vision(fast_config())
+    vision.cfg.vlm_enabled = True
+    item = bottle()
+    vision.observations = [item]
+
+    def fake_chat(prompt, image, predict=400, timeout=None):
+        assert "close-up of one object" in prompt
+        assert "Bottle" in prompt
+        assert image
+        assert predict <= 120
+        return (
+            '{"items":['
+            '{"n":1,"name":"clear water bottle","detail":"tall bottle with a white cap"},'
+            '{"n":2,"name":"extra cup","detail":"this box was not detected"}'
+            ']}'
+        )
+
+    vision._vlm_chat = fake_chat
+    vision._describe_worker(frame.getvalue(), [item])
+    assert len(vision.observations) == 1
+    assert vision.observations[0].bbox == [118, 150, 46, 120]
+    assert vision.observations[0].label == "Bottle"
+    assert vision.observations[0].name == "clear water bottle"
+    assert "tall bottle with a white cap" in vision.observations[0].attributes
+    vision.cfg.vlm_enabled = False
+    vision.clear_descriptions()
+    assert vision.observations[0].name == "clear Bottle"
+    assert vision.describe_status == ""
+
+
+def test_the_vision_model_names_every_box_instead_of_the_detector():
+    import io
+
+    from PIL import Image
+
+    from app.vision import Observation, Vision
+
+    frame = io.BytesIO()
+    Image.new("RGB", (640, 480), (20, 20, 20)).save(frame, format="JPEG")
+    vision = Vision(fast_config())
+    vision.cfg.vlm_enabled = True
+    items = []
+    for index in range(7):
+        items.append(
+            Observation(
+                id=f"temp-{index}",
+                label="Bottle",
+                kind="Bottle",
+                color="yellow",
+                name="yellow Bottle",
+                bbox=[20 + index * 80, 40, 50, 70],
+                confidence=0.9 - index * 0.05,
+                uncertain=False,
+                attributes=["Bottle"],
+                table_x=None,
+                table_y=None,
+                zone=None,
+                localizable=False,
+                localization_note="",
+                source="camera",
+                held=False,
+                frame_id="",
+            )
+        )
+    vision.observations = list(items)
+
+    calls = {"n": 0}
+
+    def fake_chat(prompt, image, predict=400, timeout=None):
+        calls["n"] += 1
+        assert "close-up of one object" in prompt
+        assert image
+        assert predict <= 120
+        return '{"items":[{"n":1,"name":"green fruit","detail":"a small fruit"}]}'
+
+    vision._vlm_chat = fake_chat
+    vision._describe_worker(frame.getvalue(), items)
+    names = [item.name for item in vision.observations]
+    assert calls["n"] == 7
+    assert len(names) == 7
+    assert all(name.startswith("green fruit") for name in names)
+    assert all(name != "yellow Bottle" for name in names)
 
 
 def test_vlm_frame_is_shrunk_before_it_is_sent():
