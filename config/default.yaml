@@ -88,12 +88,13 @@ joints:
   elbow: {min: 0, max: 180}
   wrist_vertical: {min: 0, max: 180}
   wrist_rotation: {min: 0, max: 180}
-  gripper: {min: 10, max: 73, open: 10, closed: 73}
+  cylinder: {min: 10, max: 73, open: 10, closed: 73}
 
 # Cylinder sampling cover. The jaw close_angle values below stay so older configs
 # still load. Cylinder mode does not command them.
 # Park 73° and sample 10° are dry-run assumptions, not a measured horn calibration:
-# 10° is design tilt 0° (mouth down) and 73° is design tilt -63°.
+# 10° is design tilt -38° (opening down, rim level) and 73° is design tilt -63° (cup sideways).
+# The Uno homes the cover to 73°. Reset leaves the cup sideways, not mouth-down.
 tool:
   name: Cylinder sampling cover
   inside_diameter_mm: 110
@@ -129,10 +130,10 @@ tool:
   mouth_wrist_vertical_deg: 0
   mouth_wrist_rotation_deg: 0
 
-# Taught poses. Gripper angle is filled in by the sequencer (open, calibrated close, or hold).
+# Taught poses. The cover tilt is filled in by the sequencer (park sideways, or sample down).
 # Replace these with poses you jog to on the real arm, then run a dry-run before arming.
 poses:
-  # Braccio.Begin() safety rest: lean forward, elbow folded, gripper hanging down.
+  # Same fold the Uno runs on reset. The cover parks sideways at servo 73°.
   park:
     base: 90
     shoulder: 45
@@ -174,7 +175,7 @@ zones:
     approach: {base: 125, shoulder: 130, elbow: 138, wrist_vertical: 40, wrist_rotation: 90}
     grasp: {base: 125, shoulder: 110, elbow: 82, wrist_vertical: 70, wrist_rotation: 90}
     # Cup already mouth-down. The rim drops straight down to this pose. Reteach it; do not drive the rim into the table.
-    cover: {base: 125, shoulder: 164, elbow: 144, wrist_vertical: 0, wrist_rotation: 90}
+    cover: {base: 125, shoulder: 165, elbow: 140, wrist_vertical: 3, wrist_rotation: 90}
     lift: {base: 125, shoulder: 70, elbow: 108, wrist_vertical: 80, wrist_rotation: 90}
   center:
     x: 170
@@ -182,7 +183,7 @@ zones:
     reachable: true
     approach: {base: 90, shoulder: 130, elbow: 138, wrist_vertical: 40, wrist_rotation: 90}
     grasp: {base: 90, shoulder: 112, elbow: 80, wrist_vertical: 68, wrist_rotation: 90}
-    cover: {base: 90, shoulder: 164, elbow: 144, wrist_vertical: 0, wrist_rotation: 90}
+    cover: {base: 90, shoulder: 165, elbow: 140, wrist_vertical: 3, wrist_rotation: 90}
     lift: {base: 90, shoulder: 68, elbow: 108, wrist_vertical: 78, wrist_rotation: 90}
   right:
     x: 170
@@ -190,7 +191,7 @@ zones:
     reachable: true
     approach: {base: 55, shoulder: 130, elbow: 138, wrist_vertical: 40, wrist_rotation: 90}
     grasp: {base: 55, shoulder: 110, elbow: 82, wrist_vertical: 70, wrist_rotation: 90}
-    cover: {base: 55, shoulder: 164, elbow: 144, wrist_vertical: 0, wrist_rotation: 90}
+    cover: {base: 55, shoulder: 165, elbow: 140, wrist_vertical: 3, wrist_rotation: 90}
     lift: {base: 55, shoulder: 70, elbow: 108, wrist_vertical: 80, wrist_rotation: 90}
   front:
     x: 245
@@ -198,7 +199,7 @@ zones:
     reachable: true
     approach: {base: 90, shoulder: 130, elbow: 138, wrist_vertical: 40, wrist_rotation: 90}
     grasp: {base: 90, shoulder: 108, elbow: 90, wrist_vertical: 72, wrist_rotation: 90}
-    cover: {base: 90, shoulder: 164, elbow: 144, wrist_vertical: 0, wrist_rotation: 90}
+    cover: {base: 90, shoulder: 165, elbow: 140, wrist_vertical: 3, wrist_rotation: 90}
     lift: {base: 90, shoulder: 64, elbow: 114, wrist_vertical: 76, wrist_rotation: 90}
   far:
     x: 340
@@ -206,7 +207,7 @@ zones:
     reachable: false
     approach: {base: 90, shoulder: 130, elbow: 138, wrist_vertical: 40, wrist_rotation: 90}
     grasp: {base: 90, shoulder: 112, elbow: 80, wrist_vertical: 68, wrist_rotation: 90}
-    cover: {base: 90, shoulder: 164, elbow: 144, wrist_vertical: 0, wrist_rotation: 90}
+    cover: {base: 90, shoulder: 165, elbow: 140, wrist_vertical: 3, wrist_rotation: 90}
     lift: {base: 90, shoulder: 68, elbow: 108, wrist_vertical: 78, wrist_rotation: 90}
 
 # Mock scene. close_angle is the old jaw angle. It stays readable and is not used by the cover.

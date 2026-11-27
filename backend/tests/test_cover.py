@@ -87,7 +87,7 @@ def test_servo_map_is_a_labelled_dry_run_assumption():
     assert cfg.tool.dimensions_measured is False
     assert cover_tilt_deg(cfg.tool.sample_servo_deg, cfg.tool) == -38
     assert cover_tilt_deg(cfg.tool.park_servo_deg, cfg.tool) == -63
-    assert cfg.joint_limits["gripper"] == (10, 73)
+    assert cfg.joint_limits["cylinder"] == (10, 73)
     pose = {"base": 90, "shoulder": 80, "elbow": 100, "wrist_vertical": 80, "wrist_rotation": 90}
     assert apply_mouth_offset(pose, cfg) == pose
     cfg.tool.mouth_shoulder_deg = 4
@@ -203,7 +203,7 @@ def test_descent_stops_when_the_live_target_moves_and_does_not_park():
         assert client.get("/api/state").json()["robot"]["serial_connected"] is False
 
 
-def test_armed_descent_reports_the_missing_size_without_moving():
+def test_armed_descent_continues_to_the_taught_seal_pose():
     app = create_app(fast_config())
     with TestClient(app):
         mission = app.state.ctx.mission
@@ -212,20 +212,20 @@ def test_armed_descent_reports_the_missing_size_without_moving():
         item = next(obs for obs in vision.observations if obs.id == "orange_fruit")
         mission._bounds()[0] = mission._bound_from_obs(item)
         mission.motion.mode = "armed"
-        sent_before = len(mission.motion.command_log)
         outcome = mission._lower({"tool": "lower", "object_index": 0, "object_id": "orange_fruit"})
-        assert outcome == "abort"
         text = " ".join(entry["message"] for entry in mission.timeline)
-        assert "measured object diameter" in text
-        assert len(mission.motion.command_log) == sent_before
+        assert "Hardware descent needs" not in text
+        assert "Dropping the cup straight down" in text
+        assert outcome == "abort"
+        assert "serial port is not connected" in text
 
 
-def test_cover_angles_stay_editable_and_uncalibrated():
+def test_cover_angles_stay_at_park_and_sample():
     with client_for() as client:
-        updated = client.post("/api/settings", json={"cover_park_deg": 0, "cover_sample_deg": 90}).json()
+        updated = client.post("/api/settings", json={"cover_park_deg": 40, "cover_sample_deg": 20}).json()
         tool = updated["settings"]["tool"]
-        assert tool["park_servo_deg"] == 10
-        assert tool["sample_servo_deg"] == 73
+        assert tool["park_servo_deg"] == 73
+        assert tool["sample_servo_deg"] == 10
         assert tool["angles_calibrated"] is False
         assert "Dry-run" in tool["assumption"]
 
@@ -268,9 +268,9 @@ def test_descent_stops_at_the_taught_covering_pose_and_the_hold_defaults_to_ten_
         cover = cfg.zones["front"].cover
         assert cover is not None
         assert pose["base"] == 100
-        assert pose["shoulder"] == cover.shoulder == 164
-        assert pose["elbow"] == cover.elbow == 144
-        assert pose["wrist_vertical"] == 0
+        assert pose["shoulder"] == cover.shoulder == 165
+        assert pose["elbow"] == cover.elbow == 140
+        assert pose["wrist_vertical"] == 3
         assert pose["wrist_rotation"] == 90
         hover = mission._arm_pose(bound, "approach")
         assert hover["base"] == 100
@@ -285,7 +285,7 @@ def test_descent_stops_at_the_taught_covering_pose_and_the_hold_defaults_to_ten_
         aimed_low = mission._arm_pose(bound, "lower")
         aimed_hover = mission._arm_pose(bound, "approach")
         assert aimed_low["base"] == aimed_hover["base"] == 80
-        assert aimed_low["shoulder"] == 164 and aimed_low["elbow"] == 144
+        assert aimed_low["shoulder"] == 165 and aimed_low["elbow"] == 140
         assert aimed_hover["shoulder"] == 130 and aimed_hover["elbow"] == 138
     with client_for() as client:
         updated = client.post("/api/settings", json={"sample_hold_s": 12}).json()
@@ -322,3 +322,64 @@ def test_stop_during_the_cover_hold_cancels_the_timer_and_does_not_raise():
         again = client.get("/api/state").json()
         assert again["robot"]["commands_sent"] == sent
         assert again["robot"]["moving"] is False
+
+
+def test_a_target_beyond_the_cover_aborts_before_the_arm_moves():
+    from app.cover import cover_reach_mm, mouth_reach_mm, target_reach_problem
+    from app.vision import Observation
+
+    cfg = fast_config()
+    assert 360 < mouth_reach_mm(cfg.tool) < 385
+    assert 420 < cover_reach_mm(cfg.tool) < 440
+    near = {"name": "orange fruit", "localizable": True, "table_x": 245, "table_y": 0, "zone": "front"}
+    assert target_reach_problem(near, cfg) is None
+    far = {"name": "clear Object", "localizable": True, "table_x": 520, "table_y": 0, "zone": None}
+    assert "too far" in target_reach_problem(far, cfg)
+    from app.cover import _mouth_metrics, joints_for_reach
+
+    close = {"name": "white Object", "localizable": True, "table_x": 227, "table_y": 0, "zone": None}
+    assert target_reach_problem(close, cfg) is None
+    reached = joints_for_reach(227, True)
+    radius, height, _span, _down = _mouth_metrics(
+        reached["shoulder"], reached["elbow"], reached["wrist_vertical"]
+    )
+    assert reached["shoulder"] < 160
+    assert abs(radius - 227) < 25
+    assert height < 25
+    high = {"name": "yellow apple", "localizable": False, "bbox": [307, 61, 23, 18], "zone": None}
+    assert "too far" in target_reach_problem(high, cfg)
+
+    app = create_app(cfg)
+    with TestClient(app):
+        mission = app.state.ctx.mission
+        mission.vision.observation_stale = False
+        mission.vision.observation_ts = time.time()
+        mission.vision.observations = [
+            Observation(
+                id="det-far",
+                label="Object",
+                kind="Object",
+                color="clear",
+                name="clear Object",
+                bbox=[300, 10, 40, 30],
+                confidence=0.8,
+                uncertain=False,
+                attributes=["Object"],
+                table_x=None,
+                table_y=None,
+                zone=None,
+                localizable=False,
+                localization_note="",
+                source="camera",
+                held=False,
+                frame_id="f",
+            )
+        ]
+        sent = len(mission.motion.command_log)
+        outcome = mission._locate(
+            {"tool": "locate", "object_index": 0, "object_id": "det-far", "description": "clear Object"}
+        )
+        assert outcome == "abort"
+        assert "too far" in mission.error
+        assert "approach" not in mission.record["completed"]
+        assert len(mission.motion.command_log) == sent

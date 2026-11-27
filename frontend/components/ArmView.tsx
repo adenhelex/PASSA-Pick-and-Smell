@@ -8,9 +8,6 @@ import { JOINTS, JointName, ObservationItem } from "../lib/types";
 const SCALE = 0.0118;
 const BASE: [number, number, number] = [-2.2, 0, 0.15];
 const TABLE_SIDE_MM = 560;
-/** Reachable pick area from config/default.yaml workspace (mm, base at origin). */
-const WORK_X = { min: 100, max: 260 };
-const WORK_Y = { min: -140, max: 140 };
 const MODEL_ROOT = "/models/braccio/stl";
 /** Braccio.Begin() / config poses.park — C-shaped rest from the reference photo. */
 const PARK: Record<JointName, number> = {
@@ -19,7 +16,7 @@ const PARK: Record<JointName, number> = {
   elbow: 180,
   wrist_vertical: 180,
   wrist_rotation: 90,
-  gripper: 10,
+  cylinder: 73,
 };
 const ZONES: Record<string, { x: number; y: number }> = {
   left: { x: 170, y: 110 },
@@ -84,10 +81,12 @@ function tableTwin(item: ObservationItem) {
     const [u, v, w, h] = item.bbox;
     if ((w * h) / (640 * 480) <= 0.92) {
       const across = clamp((u + w / 2) / 640, 0, 1);
-      const depth = 1 - clamp((v + h / 2) / 480, 0, 1);
-      const forward = WORK_X.min + depth * (WORK_X.max - WORK_X.min);
+      // The foot of the box is where it stands. The bottom of the photo is the
+      // base, and the top is the far edge of the table.
+      const foot = clamp((v + h) / 480, 0, 1);
+      const forward = (1 - foot) * TABLE_SIDE_MM;
       // Image-left is the low base end and sits on −Y. Image-right sits on +Y.
-      const lateral = WORK_Y.min + across * (WORK_Y.max - WORK_Y.min);
+      const lateral = (across - 0.5) * TABLE_SIDE_MM;
       const kind = objectKind(item.name);
       const tallish = kind === "bottle" || h > w * 1.2;
       return {
@@ -121,7 +120,7 @@ function applyBraccioPose(
   // Dry-run map, same numbers as config/default.yaml. Sample servo levels the
   // rim on the table. Park servo holds the cup sideways. Not calibrated.
   const span = cover.sample - cover.park;
-  const share = span === 0 ? 0 : (angles.gripper - cover.park) / span;
+  const share = span === 0 ? 0 : (angles.cylinder - cover.park) / span;
   const parkTilt = cover.parkTilt ?? -63;
   const sampleTilt = cover.sampleTilt ?? -38;
   const tilt = parkTilt + share * (sampleTilt - parkTilt);

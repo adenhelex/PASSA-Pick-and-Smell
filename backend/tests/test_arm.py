@@ -44,7 +44,7 @@ def test_taught_poses_fit_the_starter_rules():
 
 def test_joint_limits_and_base_clearance():
     cfg = Config.load()
-    current = {**cfg.park.angles(), "gripper": 10, "shoulder": 150}
+    current = {**cfg.park.angles(), "cylinder": 10, "shoulder": 150}
     script = compile_joint_script(
         current,
         {"base": 120, "shoulder": 80, "elbow": 100, "wrist_vertical": 90, "wrist_rotation": 90},
@@ -58,7 +58,7 @@ def test_joint_limits_and_base_clearance():
         compile_joint_script(current, cfg.park.angles(), 5, cfg)
     with pytest.raises(MotionRejected):
         compile_joint_script(
-            {**cfg.park.angles(), "gripper": 10, "shoulder": 150},
+            {**cfg.park.angles(), "cylinder": 10, "shoulder": 150},
             {"base": 90, "shoulder": 80, "elbow": 20, "wrist_vertical": 90, "wrist_rotation": 90},
             10,
             cfg,
@@ -73,7 +73,7 @@ def test_park_folds_the_shoulder_before_returning_the_base():
         "elbow": 170,
         "wrist_vertical": 160,
         "wrist_rotation": 90,
-        "gripper": 71,
+        "cylinder": 71,
     }
     script = compile_joint_script(reached, cfg.park.angles(), cfg.gripper_open, cfg)
     assert script.index(("shoulder", 45)) < script.index(("base", 90))
@@ -97,12 +97,40 @@ def test_image_coordinate_without_calibration_is_not_a_pose():
     assert projected.x is not None and projected.y is not None
 
 
+def test_firmware_rest_parks_the_cover_and_rejects_a_jaw_command():
+    from app.motion import FIRMWARE_HOME, parse_status
+
+    sim = FirmwareSim(move_s=0.01)
+    try:
+        assert b"READY" in sim.readline()
+        sim.submit("status")
+        status = parse_status(sim.readline().decode())
+        assert status == FIRMWARE_HOME
+        assert status["cylinder"] == 73
+        sim.submit("cylinder sample")
+        assert sim.readline() == b"OK moving\n"
+        assert sim.readline() == b"DONE\n"
+        assert sim.angles["cylinder"] == 10
+        sim.submit("cylinder park")
+        assert sim.readline() == b"OK moving\n"
+        assert sim.readline() == b"DONE\n"
+        assert sim.angles["cylinder"] == 73
+        sim.submit("cylinder rotate 0")
+        assert b"angle range 10 to 73" in sim.readline()
+        sim.submit("cylinder rotate 40")
+        assert b"10 or 73 only" in sim.readline()
+    finally:
+        sim.close()
+
+
 def test_firmware_noop_is_immediate_done():
     sim = FirmwareSim(move_s=0.05)
     try:
         assert b"READY" in sim.readline()
-        sim.submit("gripper rotate 10")
+        sim.submit("cylinder rotate 73")
         assert sim.readline() == b"DONE\n"
+        sim.submit("gripper grab object")
+        assert b"the joint is cylinder" in sim.readline()
         sim.submit("base rotate 100")
         assert sim.readline() == b"OK moving\n"
         assert sim.readline() == b"DONE\n"
@@ -121,14 +149,14 @@ def test_stop_acks_and_timeout_is_not_replayed():
         ctrl.connect("mock://braccio", confirm_reset=True)
         assert ctrl.export()["angles"]["base"] == 90
         ctrl._link.sim.stall_next = True
-        stalled = ctrl.jog("elbow", 10)
+        stalled = ctrl.jog("shoulder", 10)
         assert stalled.uncertain
-        assert ctrl.command_log.count("elbow rotate 100") == 1
-        refused = ctrl.jog("elbow", 10)
+        assert ctrl.command_log.count("shoulder rotate 55") == 1
+        refused = ctrl.jog("shoulder", 10)
         assert refused.ok is False
-        assert ctrl.command_log.count("elbow rotate 100") == 1
+        assert ctrl.command_log.count("shoulder rotate 55") == 1
         ctrl.stop()
-        assert ctrl.command_log.count("elbow rotate 100") == 1
+        assert ctrl.command_log.count("shoulder rotate 55") == 1
         synced = ctrl.sync_status()
         assert synced.ok
 
@@ -343,8 +371,8 @@ def test_an_image_target_is_aimed_within_joint_limits():
         client.post("/api/run")
         state = wait_mission(client)
         commands = " ".join(_commands(client))
-        assert "gripper rotate 73" in commands
-        assert "gripper rotate 48" not in commands
+        assert "cylinder rotate 73" in commands
+        assert "cylinder rotate 48" not in commands
         assert state["mission"]["outcome"] != "skipped"
 
 
@@ -426,7 +454,7 @@ def test_manual_jog_is_rejected_during_a_mission_and_limits_apply():
     cfg = fast_config()
     cfg.sim_joint_s = 0.4
     with client_for(cfg) as client:
-        denied = client.post("/api/jog", json={"joint": "gripper", "delta": -5})
+        denied = client.post("/api/jog", json={"joint": "cylinder", "delta": 5})
         assert denied.status_code == 400
         client.post("/api/command", json={"text": "Show me what's on the table."})
         client.post("/api/run")
@@ -451,6 +479,81 @@ def test_missing_capability_and_scene_survey():
         assert "grasp" not in tools
 
 
+def test_hardware_connect_retries_a_reset_glitch_and_reports_a_busy_port(monkeypatch):
+    import serial
+
+    from app.motion import FIRMWARE_HOME, format_status
+
+    cfg = fast_config()
+    cfg.serial_mode = "hardware"
+    cfg.ready_timeout_s = 2
+    ctrl = MotionController(cfg)
+    ctrl.start()
+    made: list = []
+
+    class Port:
+        def __init__(self, fail_read: bool):
+            self.fail_read = fail_read
+            self.is_open = True
+            self.pending: list[bytes] = []
+            self.closed = False
+
+        def readline(self):
+            if self.fail_read:
+                self.fail_read = False
+                raise OSError(
+                    "device reports readiness to read but returned no data "
+                    "(device disconnected or multiple access on port?)"
+                )
+            if self.pending:
+                return self.pending.pop(0)
+            time.sleep(0.02)
+            return b""
+
+        def write(self, data: bytes):
+            if data.decode().strip() == "status":
+                self.pending.append((format_status(FIRMWARE_HOME) + "\n").encode())
+
+        def flush(self):
+            pass
+
+        def close(self):
+            self.is_open = False
+            self.closed = True
+
+        def cancel_read(self):
+            self.is_open = False
+
+    def factory(port, baud, timeout=0.2, exclusive=None):
+        assert exclusive is True
+        assert port == "/dev/cu.usbmodem11301"
+        first = not made
+        opened = Port(fail_read=first)
+        if not first:
+            opened.pending.append(b"READY Braccio UART\n")
+        made.append(opened)
+        return opened
+
+    monkeypatch.setattr(serial, "Serial", factory)
+    result = ctrl.connect("/dev/cu.usbmodem11301", confirm_reset=True)
+    assert result["synced"] is True
+    assert made[0].closed is True
+    assert len(made) >= 2
+    ctrl.shutdown()
+
+    def busy(*_args, **_kwargs):
+        raise serial.SerialException("[Errno 16] Resource busy")
+
+    monkeypatch.setattr(serial, "Serial", busy)
+    cfg.ready_timeout_s = 0.45
+    blocked = MotionController(cfg)
+    blocked.start()
+    with pytest.raises(MotionRejected) as caught:
+        blocked.connect("/dev/cu.usbmodem11301", confirm_reset=True)
+    assert "already open in another program" in caught.value.message
+    blocked.shutdown()
+
+
 def test_connect_warns_and_stop_endpoint_does_not_need_a_plan():
     with client_for() as client:
         denied = client.post("/api/serial/connect", json={"port": "mock://braccio", "confirm_reset": False})
@@ -461,7 +564,7 @@ def test_connect_warns_and_stop_endpoint_does_not_need_a_plan():
         assert connected.json()["synced"] is True
         state = client.get("/api/state").json()
         assert state["robot"]["joint_source"] == "firmware"
-        assert state["robot"]["angles"]["gripper"] == 10
+        assert state["robot"]["angles"]["cylinder"] == 73
         client.post("/api/serial/disconnect")
         unknown = client.get("/api/state").json()["robot"]
         assert unknown["joints_known"] is False

@@ -42,7 +42,7 @@ def pose_problem(arm: dict, cfg: Config, gripper: float) -> str | None:
         problem = limit_problem(joint, arm[joint], cfg)
         if problem:
             return problem
-    problem = limit_problem("gripper", gripper, cfg)
+    problem = limit_problem("cylinder", gripper, cfg)
     if problem:
         return problem
     if (
@@ -68,10 +68,12 @@ def compile_joint_script(
 ) -> list[tuple[str, int]]:
     """Validate the whole single-joint path before any serial command is sent.
 
-    The firmware moves one joint per command. Before the base yaws, an
-    outstretched shoulder is folded back so the base servo is not swinging a
-    reached arm. The gripper opens before a swing and closes only after the
-    arm joints have arrived.
+    Each rotate line moves one joint, and the host waits for DONE. Home is the
+    one command that moves every joint, back to the folded rest with the cover
+    parked sideways. Before the base yaws, an outstretched shoulder is folded
+    back so the base servo is not swinging a reached arm. A move toward the
+    sample tilt happens before the arm; the return to the park tilt happens
+    after the arm has arrived.
     """
     if any(name not in current or current[name] is None for name in JOINTS):
         raise MotionRejected("Commanded joint angles are unknown. Sync status before moving.")
@@ -90,15 +92,15 @@ def compile_joint_script(
             return
         nxt = dict(pose)
         nxt[joint] = angle
-        problem = pose_problem(nxt, cfg, nxt["gripper"])
+        problem = pose_problem(nxt, cfg, nxt["cylinder"])
         if problem:
             raise MotionRejected(f"Intermediate pose after {joint} → {angle}°: {problem}")
         pose[joint] = angle
         script.append((joint, angle))
 
-    opening = gripper_i < pose["gripper"]
+    opening = gripper_i < pose["cylinder"]
     if opening:
-        commit("gripper", gripper_i)
+        commit("cylinder", gripper_i)
 
     base_delta = abs(rounded_arm["base"] - pose["base"])
     if base_delta > 0:
@@ -120,9 +122,9 @@ def compile_joint_script(
     for joint in ("base", "elbow", "wrist_vertical", "wrist_rotation", "shoulder"):
         commit(joint, rounded_arm[joint])
     if not opening:
-        commit("gripper", gripper_i)
+        commit("cylinder", gripper_i)
 
-    final_problem = pose_problem(pose, cfg, pose["gripper"])
+    final_problem = pose_problem(pose, cfg, pose["cylinder"])
     if final_problem:
         raise MotionRejected(final_problem)
     return script
@@ -131,6 +133,8 @@ def compile_joint_script(
 def jog_target(current: dict[str, float], joint: str, delta: float, cfg: Config) -> int:
     if joint not in JOINTS:
         raise MotionRejected(f"{joint} is not a joint on this arm.")
+    if joint == "cylinder":
+        raise MotionRejected("The cylinder only moves to 10° (sample) or 73° (park).")
     if abs(delta) > 15:
         raise MotionRejected("Jog steps are limited to 15°.")
     if any(current.get(name) is None for name in JOINTS):
@@ -146,7 +150,7 @@ def jog_target(current: dict[str, float], joint: str, delta: float, cfg: Config)
             )
     trial = {name: _round_deg(current[name]) for name in JOINTS}
     trial[joint] = angle
-    problem = pose_problem(trial, cfg, trial["gripper"])
+    problem = pose_problem(trial, cfg, trial["cylinder"])
     if problem:
         raise MotionRejected(problem)
     return angle
@@ -221,6 +225,27 @@ def _table_depth(down: float) -> float:
     if span <= 1e-6:
         return 1.0 - down
     return min(1.0, max(0.0, (ground - near_ground) / span))
+
+
+# The twin's table is this long, with the base on the near edge. The back edge is past the cover.
+TABLE_SIDE_MM = 560.0
+
+
+def image_table_point(bbox: list[float], cfg: Config) -> tuple[float, float]:
+    """Estimate where a box stands, in millimetres from the base.
+
+    The camera is not calibrated. Distance is the foot of the box: the bottom
+    of the photo is the base, and the top is the far edge of the table. A box
+    halfway up the frame is halfway down the table. Image-left is −Y.
+    """
+    u, v, w, h = (list(bbox) + [0, 0, 80, 80])[:4]
+    width = float(cfg.calibration.get("image_width") or 640) or 640
+    height = float(cfg.calibration.get("image_height") or 480) or 480
+    across = min(1.0, max(0.0, (float(u) + float(w) / 2) / width))
+    foot_down = min(1.0, max(0.0, (float(v) + float(h)) / height))
+    forward = (1.0 - foot_down) * TABLE_SIDE_MM
+    lateral = (across - 0.5) * TABLE_SIDE_MM
+    return forward, lateral
 
 
 def _plain_aim(across: float, down: float, depth: float, cfg: Config) -> dict[str, float]:

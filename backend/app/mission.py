@@ -11,10 +11,13 @@ from app.config import ARM_JOINTS, Config
 from app.cover import (
     JAW_TOOLS,
     apply_mouth_offset,
+    cover_pose_at_distance,
     cover_still_low,
     descent_block,
     descent_gate,
     jaw_refusal,
+    target_point_mm,
+    target_reach_problem,
     tilt_reference,
     vertical_cover_pose,
 )
@@ -486,18 +489,30 @@ class Mission:
         if zone is None:
             bound["zone"] = None
             bound["aim"] = aim_from_bbox(bound.get("bbox") or [280, 200, 80, 80], self.cfg)
+            point = target_point_mm(bound, self.cfg)
+            if point is not None:
+                bound["table_x"] = round(point[0])
+                bound["table_y"] = round(point[1])
             self._bounds()[step["object_index"]] = bound
+            refused = self._refuse_if_too_far(bound, step)
+            if refused:
+                return refused
+            distance = math.hypot(point[0], point[1]) if point is not None else None
+            where = f", about {distance:.0f} mm from the base" if distance is not None else ""
             self._phase("target_found")
             self._log(
                 "target_found",
                 "observation",
-                f"Target found: {bound['name']}. The arm will follow it and adjust left, right, near, and far. "
-                "Only the arm's joint limits apply.",
+                f"Target found: {bound['name']}{where}. "
+                "Higher in the picture is farther from the arm, and lower is nearer.",
             )
             return "ok"
         bound["zone"] = zone.id
         bound["aim"] = None
         self._bounds()[step["object_index"]] = bound
+        refused = self._refuse_if_too_far(bound, step)
+        if refused:
+            return refused
         self._phase("target_found")
         self._log("target_found", "observation", f"Target found: {bound['name']} in {zone.id}.")
         return "ok"
@@ -513,6 +528,9 @@ class Mission:
             return "skip"
         self._phase("approaching")
         self._refresh_aim(bound)
+        refused = self._refuse_if_too_far(bound, step)
+        if refused:
+            return refused
         if bound.get("aim"):
             self._log("approaching", "info", f"Reaching out over the {bound['name']} with the cup still clear.")
         return self._move(
@@ -552,6 +570,9 @@ class Mission:
             self._log("lowering", "error", block)
             return "abort"
         self._refresh_aim(bound)
+        refused = self._refuse_if_too_far(bound, step)
+        if refused:
+            return refused
         pose, endpoint = self._covering_pose(bound)
         start = list(bound.get("bbox") or [])
         live = self._live_object(bound["object_id"])
@@ -925,7 +946,7 @@ class Mission:
 
     def _sampling_position_problem(self, bound: dict) -> str | None:
         angles = self.motion.export()["angles"]
-        servo = angles.get("gripper")
+        servo = angles.get("cylinder")
         if servo is None or abs(float(servo) - self._servo("sample")) > 3:
             return "The cover is not at the sampling tilt, so odor sampling did not start."
         lowered = self._arm_pose(bound, "lower")
@@ -1099,7 +1120,7 @@ class Mission:
 
     def _covering_pose(self, bound: dict) -> tuple[dict, str]:
         """Rim endpoint of the straight drop. The opening is already facing down."""
-        pose = apply_mouth_offset(vertical_cover_pose(self._heading(bound), low=True), self.cfg)
+        pose = self._arm_pose(bound, "lower")
         if self.cfg.tool.surface_calibrated:
             return pose, (
                 f"vertical covering pose for the calibrated surface at {self.cfg.tool.surface_z_mm:g} mm"
@@ -1108,7 +1129,13 @@ class Mission:
 
     def _arm_pose(self, bound: dict, kind: str) -> dict:
         if kind in {"approach", "align", "raise", "lower"}:
-            return apply_mouth_offset(vertical_cover_pose(self._heading(bound), low=kind == "lower"), self.cfg)
+            low = kind == "lower"
+            if not bound.get("zone"):
+                point = target_point_mm(bound, self.cfg)
+                if point is not None:
+                    distance = math.hypot(point[0], point[1])
+                    return cover_pose_at_distance(self._heading(bound), distance, low, self.cfg)
+            return apply_mouth_offset(vertical_cover_pose(self._heading(bound), low=low), self.cfg)
         source = {"align": "approach", "raise": "approach"}.get(kind, kind)
         aim = bound.get("aim") or {}
         if source in aim:
@@ -1150,6 +1177,17 @@ class Mission:
             self.status = "running"
         self._touch()
         return answer
+
+    def _refuse_if_too_far(self, bound: dict, step: dict) -> str | None:
+        reason = target_reach_problem(bound, self.cfg)
+        if not reason:
+            return None
+        self._bounds()[step["object_index"]] = bound
+        self._phase("blocked")
+        self._log("blocked", "error", reason)
+        with self._lock:
+            self.error = reason
+        return "abort"
 
     def _remember(self, bound: dict) -> None:
         with self._lock:

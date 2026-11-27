@@ -14,7 +14,7 @@ from __future__ import annotations
 import math
 
 from app.config import CoverTool, Config
-from app.geometry import _clamp_pose
+from app.geometry import _clamp_pose, image_table_point
 
 # Design assembly, millimetres, wrist-mesh vertex frame.
 COVER_PIVOT_MM = (-6.0, 40.5, 47.0)
@@ -35,9 +35,9 @@ COVER_HOVER_JOINTS = {
     "wrist_rotation": 90.0,
 }
 COVER_LOW_JOINTS = {
-    "shoulder": 164.0,
-    "elbow": 144.0,
-    "wrist_vertical": 0.0,
+    "shoulder": 165.0,
+    "elbow": 140.0,
+    "wrist_vertical": 3.0,
     "wrist_rotation": 90.0,
 }
 
@@ -114,23 +114,14 @@ def descent_gate(tool: CoverTool, armed: bool) -> tuple[str | None, str]:
             f"cover's {tool.clear_height_mm:g} mm clear height"
         )
     note = assumption_note(tool)
-    if tool.dimensions_measured and tool.angles_calibrated and not problems:
-        return None, "Object size and cover angles are marked as measured."
-    if armed:
-        missing = []
-        if not tool.dimensions_measured:
-            missing.append("a measured object diameter and height in millimetres")
-        if not tool.angles_calibrated:
-            missing.append("calibrated park and sampling cover angles")
-        missing.extend(problems)
+    if problems:
         return (
-            "Hardware descent needs "
-            + "; ".join(missing)
-            + ". The camera bounding box does not provide object size or table height.",
+            "The cover will not lower: " + "; ".join(problems) + ".",
             note,
         )
-    if problems:
-        return "Dry-run will not lower the cover: " + "; ".join(problems) + ".", note
+    if tool.dimensions_measured and tool.angles_calibrated:
+        return None, "Object size and cover angles are marked as measured."
+    # The rim stops at the taught covering pose. Object size is not the table height.
     return None, note
 
 
@@ -174,6 +165,188 @@ def tilt_reference(tool: CoverTool) -> str:
         "That check excludes the rest of the arm, camera, cables, fasteners, and table. "
         "Physical clearance and the real servo angles still need calibration."
     )
+
+
+def _matmul(a, b):
+    return tuple(tuple(sum(a[i][k] * b[k][j] for k in range(3)) for j in range(3)) for i in range(3))
+
+
+def _matvec(m, v):
+    return tuple(sum(m[i][k] * v[k] for k in range(3)) for i in range(3))
+
+
+def _rot(axis: str, deg: float):
+    a = math.radians(deg)
+    c, s = math.cos(a), math.sin(a)
+    if axis == "x":
+        return ((1.0, 0.0, 0.0), (0.0, c, -s), (0.0, s, c))
+    if axis == "y":
+        return ((c, 0.0, s), (0.0, 1.0, 0.0), (-s, 0.0, c))
+    return ((c, -s, 0.0), (s, c, 0.0), (0.0, 0.0, 1.0))
+
+
+def _transform(point, rotation, origin):
+    turned = _matvec(rotation, point)
+    return (turned[0] + origin[0], turned[1] + origin[1], turned[2] + origin[2])
+
+
+def _z_up():
+    """Three.js Euler XYZ (90°, 180°, 0°): URDF Z-up into the twin's table frame."""
+    x, y = math.pi / 2, math.pi
+    cx, sx = math.cos(x), math.sin(x)
+    cy, sy = math.cos(y), math.sin(y)
+    return ((cy, 0.0, sy), (sx * sy, cx, -sx * cy), (-cx * sy, sx, cx * cy))
+
+
+_Z_UP = _z_up()
+_REACH_GRID: list[tuple] | None = None
+
+
+def _mouth_metrics(shoulder: float, elbow: float, wrist: float, tilt: float = -38.0):
+    """Mouth center radius, lowest rim height, rim span, and opening direction.
+
+    Opening direction is the table-frame Z of the mouth axis. -1 faces the table.
+    """
+    cx, cy, z = COVER_CENTER_XY_MM[0], COVER_CENTER_XY_MM[1], MOUTH_PLANE_Z_MM
+    samples = [(cx, cy, z), (cx, cy, z - 50.0)]
+    for step in range(4):
+        angle = step * math.pi / 2
+        samples.append((cx + 55.0 * math.cos(angle), cy + 55.0 * math.sin(angle), z))
+    placed = []
+    pivot = (COVER_PIVOT_MM[0] / 1000.0, COVER_PIVOT_MM[1] / 1000.0, COVER_PIVOT_MM[2] / 1000.0)
+    for x, y, zz in samples:
+        point = ((x - COVER_PIVOT_MM[0]) / 1000.0, (y - COVER_PIVOT_MM[1]) / 1000.0, (zz - COVER_PIVOT_MM[2]) / 1000.0)
+        point = _transform(point, _rot("y", tilt), pivot)
+        point = _transform(point, _rot("x", 0), (0.006, 0.0, 0.0))
+        point = _transform(point, _rot("z", -90), (0.0, 0.0, 0.06))
+        point = _transform(point, _matmul(_rot("x", -90), _rot("x", wrist)), (0.0, 0.0, 0.125))
+        point = _transform(point, _matmul(_rot("x", -90), _rot("x", elbow)), (0.0, 0.0, 0.125))
+        point = _transform(point, _matmul(_rot("x", -90), _rot("x", shoulder)), (0.0, -0.002, 0.072))
+        scene = _matvec(_Z_UP, point)
+        placed.append((scene[0] * 1000.0, scene[2] * 1000.0, scene[1] * 1000.0))
+    center, tip, *ring = placed
+    opening = tuple(tip[i] - center[i] for i in range(3))
+    norm = math.sqrt(sum(value * value for value in opening)) or 1.0
+    heights = [point[2] for point in (center, *ring)]
+    return (
+        math.hypot(center[0], center[1]),
+        min(heights),
+        max(heights) - min(heights),
+        opening[2] / norm,
+    )
+
+
+def mouth_reach_mm(tool: CoverTool | None = None) -> float:
+    """Distance from the base to the mouth center at the fully extended seal.
+
+    Same joint chain as the twin. The shoulder is on its upper limit there.
+    Closer targets use other joint angles inside the same limits.
+    """
+    tilt = -38.0 if tool is None else tool.design_tilt_at_sample_deg
+    radius, *_rest = _mouth_metrics(
+        COVER_LOW_JOINTS["shoulder"],
+        COVER_LOW_JOINTS["elbow"],
+        COVER_LOW_JOINTS["wrist_vertical"],
+        tilt,
+    )
+    return radius
+
+
+def _reach_grid() -> list[tuple]:
+    """Legal sample-tilt poses whose opening still faces mostly downward."""
+    global _REACH_GRID
+    if _REACH_GRID is not None:
+        return _REACH_GRID
+    rows = []
+    samples = [
+        (shoulder, elbow, wrist)
+        for shoulder in range(35, 166, 5)
+        for elbow in range(40, 181, 5)
+        for wrist in range(0, 181, 5)
+    ]
+    samples.append((
+        int(COVER_LOW_JOINTS["shoulder"]),
+        int(COVER_LOW_JOINTS["elbow"]),
+        int(COVER_LOW_JOINTS["wrist_vertical"]),
+    ))
+    for shoulder, elbow, wrist in samples:
+        if elbow < 35 and shoulder > 140:
+            continue
+        radius, low, span, down = _mouth_metrics(shoulder, elbow, wrist)
+        if low < -3 or down > -0.55:
+            continue
+        rows.append((radius, low, span, down, float(shoulder), float(elbow), float(wrist)))
+    _REACH_GRID = rows
+    return rows
+
+
+def joints_for_reach(distance_mm: float, low: bool) -> dict[str, float]:
+    """Shoulder, elbow, and wrist that put the mouth near this distance.
+
+    The low pose sets the rim against the table. The hover pose holds it about
+    110 mm up at the same distance. Both stay inside the joint limits.
+    """
+    goal_height = 0.0 if low else 110.0
+    best = None
+    for radius, height, span, down, shoulder, elbow, wrist in _reach_grid():
+        score = (
+            abs(radius - distance_mm) * 4
+            + abs(height - goal_height) * 1.2
+            + span * 0.08
+            + (down + 1) * 90
+        )
+        if height < -1:
+            score += 30 * (-1 - height)
+        if best is None or score < best[0]:
+            best = (score, shoulder, elbow, wrist)
+    _score, shoulder, elbow, wrist = best
+    return {
+        "shoulder": shoulder,
+        "elbow": elbow,
+        "wrist_vertical": wrist,
+        "wrist_rotation": COVER_LOW_JOINTS["wrist_rotation"],
+    }
+
+
+def cover_pose_at_distance(base: float, distance_mm: float, low: bool, cfg: Config) -> dict:
+    """Cover pose for one distance. Only the base heading is shared with the target."""
+    pose = {"base": float(base) + SEAL_BASE_OFFSET, **joints_for_reach(distance_mm, low)}
+    return apply_mouth_offset(pose, cfg)
+
+
+def cover_reach_mm(tool: CoverTool) -> float:
+    """Farthest object center the mouth can still sit over."""
+    return mouth_reach_mm(tool) + tool.inside_diameter_mm / 2.0
+
+
+def target_point_mm(bound: dict, cfg: Config) -> tuple[float, float] | None:
+    if bound.get("localizable") and bound.get("table_x") is not None and bound.get("table_y") is not None:
+        return float(bound["table_x"]), float(bound["table_y"])
+    bbox = bound.get("bbox")
+    if bbox and len(bbox) >= 4:
+        return image_table_point(bbox, cfg)
+    zone = cfg.zones.get(bound.get("zone") or "")
+    if zone is not None:
+        return float(zone.x), float(zone.y)
+    return None
+
+
+def target_reach_problem(bound: dict, cfg: Config) -> str | None:
+    """Tell the user when the object is outside the cover's reach. None when it can seal."""
+    point = target_point_mm(bound, cfg)
+    if point is None:
+        return None
+    distance = math.hypot(point[0], point[1])
+    tool = cfg.tool
+    far_limit = cover_reach_mm(tool)
+    name = bound.get("name") or "object"
+    if distance > far_limit:
+        return (
+            f"The {name} is too far for the arm. "
+            f"It is about {distance:.0f} mm from the base, and the cover only reaches about {far_limit:.0f} mm. "
+            "I did not move the cover."
+        )
+    return None
 
 
 def jaw_refusal(tool: str) -> str:

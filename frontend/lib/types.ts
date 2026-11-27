@@ -4,7 +4,7 @@ export type JointName =
   | "elbow"
   | "wrist_vertical"
   | "wrist_rotation"
-  | "gripper";
+  | "cylinder";
 
 export interface ObservationItem {
   id: string;
@@ -159,7 +159,7 @@ export const JOINTS: Array<{ key: JointName; label: string }> = [
   { key: "elbow", label: "Elbow" },
   { key: "wrist_vertical", label: "Wrist vertical" },
   { key: "wrist_rotation", label: "Wrist rotation" },
-  { key: "gripper", label: "Cover tilt" },
+  { key: "cylinder", label: "Cylinder" },
 ];
 
 export const BACKEND = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://127.0.0.1:8000";

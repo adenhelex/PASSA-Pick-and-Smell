@@ -135,13 +135,6 @@ def create_app(config: Config | None = None) -> FastAPI:
         for axis, field in (("x", "aim_offset_x"), ("y", "aim_offset_y"), ("z", "aim_offset_z")):
             if field in data:
                 setattr(ctx.cfg, field, max(0.5, min(4.0, float(data[field]))))
-        if "cover_park_deg" in data or "cover_sample_deg" in data:
-            lo, hi = ctx.cfg.joint_limits["gripper"]
-            if "cover_park_deg" in data:
-                ctx.cfg.tool.park_servo_deg = max(lo, min(hi, float(data["cover_park_deg"])))
-            if "cover_sample_deg" in data:
-                ctx.cfg.tool.sample_servo_deg = max(lo, min(hi, float(data["cover_sample_deg"])))
-            ctx.cfg.tool.angles_calibrated = False
         if "sample_hold_s" in data:
             ctx.cfg.sample_hold_s = max(1.0, min(120.0, float(data["sample_hold_s"])))
         if not offset_only and not vision_only:
@@ -233,10 +226,10 @@ def create_app(config: Config | None = None) -> FastAPI:
         _require_manual()
         return _finish(ctx.motion.home())
 
-    @app.post("/api/gripper")
-    def gripper(body: GripperIn):
+    @app.post("/api/cylinder")
+    def cylinder(body: CylinderIn):
         _require_manual()
-        return _finish(ctx.motion.gripper_action(body.action))
+        return _finish(ctx.motion.cylinder_action(body.action))
 
     @app.post("/api/jog")
     def jog(body: JogIn):
@@ -350,7 +343,7 @@ class SettingsIn(BaseModel):
     sample_hold_s: float | None = None
 
 
-class GripperIn(BaseModel):
+class CylinderIn(BaseModel):
     action: str
 
 

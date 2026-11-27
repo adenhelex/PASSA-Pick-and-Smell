@@ -28,9 +28,29 @@ def parse_status(line: str) -> dict[str, float] | None:
     return found
 
 
-def format_status(angles: dict[str, float]) -> str:
+# Folded rest written into firmware/passa_braccio/passa_braccio.ino.
+# Servo M6 is the cylinder. 73 parks the cup sideways.
+FIRMWARE_HOME = {
+    "base": 90,
+    "shoulder": 45,
+    "elbow": 180,
+    "wrist_vertical": 180,
+    "wrist_rotation": 90,
+    "cylinder": 73,
+}
+FIRMWARE_LIMITS = {
+    "base": (0, 180),
+    "shoulder": (15, 165),
+    "elbow": (0, 180),
+    "wrist_vertical": (0, 180),
+    "wrist_rotation": (0, 180),
+    "cylinder": (10, 73),
+}
+
+
+def format_status(angles: dict[str, float], activity: str = "idle") -> str:
     parts = " ".join(f"{name}={int(round(angles[name]))}" for name in JOINTS)
-    return f"STATUS {parts}"
+    return f"STATUS {activity} {parts}"
 
 
 @dataclass
@@ -60,16 +80,13 @@ class _Job:
 class FirmwareSim:
     """Small stand-in for the Uno sketch. One command at a time, stop wins."""
 
-    def __init__(self, move_s: float = 0.4):
+    def __init__(self, move_s: float = 0.4, home: dict[str, int] | None = None, sample: int = 10):
         self.move_s = move_s
-        self.angles = {
-            "base": 90,
-            "shoulder": 90,
-            "elbow": 90,
-            "wrist_vertical": 90,
-            "wrist_rotation": 90,
-            "gripper": 10,
-        }
+        self.home = {name: int(FIRMWARE_HOME[name]) for name in JOINTS}
+        if home:
+            self.home.update({name: int(round(home[name])) for name in JOINTS if name in home})
+        self.sample = int(sample)
+        self.angles = dict(self.home)
         self.commands: queue.Queue[str | None] = queue.Queue()
         self.out: queue.Queue[bytes] = queue.Queue()
         self.alive = True
@@ -95,7 +112,7 @@ class FirmwareSim:
             return b""
 
     def force_reset(self) -> None:
-        self.angles = {name: 90 if name != "gripper" else 10 for name in JOINTS}
+        self.angles = dict(self.home)
         self.out.put(b"READY Braccio UART\n")
 
     def _emit(self, text: str) -> None:
@@ -137,15 +154,17 @@ class FirmwareSim:
             self._emit("OK moving")
             if self._wait_or_stop(self.move_s):
                 return
-            for name in JOINTS:
-                self.angles[name] = 10 if name == "gripper" else 90
+            self.angles = dict(self.home)
             self._emit("DONE")
             return
-        if cmd == "gripper grab object":
-            self._move_joint("gripper", 73)
+        if cmd.startswith("gripper"):
+            self._emit("ERR the joint is cylinder; use cylinder rotate, park, or sample")
             return
-        if cmd == "gripper release":
-            self._move_joint("gripper", 10)
+        if cmd == "cylinder park":
+            self._move_joint("cylinder", self.home["cylinder"])
+            return
+        if cmd == "cylinder sample":
+            self._move_joint("cylinder", self.sample)
             return
         parts = cmd.split()
         if len(parts) == 3 and parts[1] == "rotate":
@@ -153,10 +172,17 @@ class FirmwareSim:
             try:
                 angle = int(float(parts[2]))
             except ValueError:
-                self._emit("ERR bad angle")
+                self._emit("ERR angle must be a whole number")
                 return
             if joint not in JOINTS:
                 self._emit("ERR unknown joint")
+                return
+            lo, hi = FIRMWARE_LIMITS[joint]
+            if angle < lo or angle > hi:
+                self._emit(f"ERR angle range {lo} to {hi}")
+                return
+            if joint == "cylinder" and angle not in (self.sample, int(self.home["cylinder"])):
+                self._emit("ERR cylinder is 10 or 73 only")
                 return
             self._move_joint(joint, angle)
             return
@@ -218,12 +244,24 @@ class SerialLink:
             return self.sim.readline()
         return self.raw.readline()
 
+    def cancel_read(self) -> None:
+        raw = self.raw
+        if raw is None:
+            return
+        cancel = getattr(raw, "cancel_read", None)
+        if cancel is not None:
+            cancel()
+
     def close(self) -> None:
         self._open = False
         if self.sim is not None:
             self.sim.close()
+            self.sim = None
         elif self.raw is not None:
-            self.raw.close()
+            try:
+                self.raw.close()
+            finally:
+                self.raw = None
 
 
 class MotionController:
@@ -255,7 +293,7 @@ class MotionController:
         self.command_log: list[str] = []
         self.last_error = ""
         self._angles: dict[str, float | None] = dict(cfg.park.angles())
-        self._angles["gripper"] = cfg.gripper_open
+        self._angles["cylinder"] = cfg.tool.park_servo_deg
         self.on_change = lambda: None
 
     def start(self) -> None:
@@ -345,32 +383,30 @@ class MotionController:
         if self.mission_is_active():
             raise MotionRejected("Stop the mission before connecting.")
         self.disconnect(notify=False)
+        self.release_cancel()
         self.serial_port = port or self.serial_port
         if self.serial_mode == "mock":
-            link = SerialLink(sim=FirmwareSim(move_s=max(0.05, self.cfg.sim_joint_s)))
+            link = SerialLink(sim=FirmwareSim(
+                move_s=max(0.05, self.cfg.sim_joint_s),
+                home={**self.cfg.park.angles(), "cylinder": self.cfg.tool.park_servo_deg},
+                sample=int(round(self.cfg.tool.sample_servo_deg)),
+            ))
         else:
             if not self.serial_port:
                 raise MotionRejected("Choose the Arduino Uno serial port first.")
-            try:
-                import serial
-            except ImportError as exc:
-                raise MotionRejected("pyserial is not installed.") from exc
-            try:
-                raw = serial.Serial(self.serial_port, self.cfg.baud, timeout=0.2)
-            except Exception as exc:
-                raise MotionRejected(f"Could not open {self.serial_port}: {exc}") from exc
-            link = SerialLink(raw=raw)
+            link = self._acquire_hardware(self.serial_port)
         self._link = link
         self._reader_alive = True
         self._reader = threading.Thread(target=self._reader_loop, name="motion-reader", daemon=True)
         self._reader.start()
-        ready = self._wait_for(self.cfg.ready_token, self.cfg.ready_timeout_s)
-        if ready is None:
-            self.disconnect(notify=False)
-            raise MotionRejected(
-                "Did not receive READY Braccio UART. The board may still be resetting, "
-                "or the sketch is not this firmware."
-            )
+        if self.serial_mode == "mock":
+            ready = self._wait_for(self.cfg.ready_token, self.cfg.ready_timeout_s)
+            if ready is None:
+                self.disconnect(notify=False)
+                raise MotionRejected(
+                    "Did not receive READY Braccio UART. The board may still be resetting, "
+                    "or the sketch is not this firmware."
+                )
         with self._lock:
             self.connected = True
             self.unexpected_reset = False
@@ -390,13 +426,21 @@ class MotionController:
 
     def disconnect(self, notify: bool = True) -> None:
         self._reader_alive = False
-        link = self._link
-        self._link = None
+        with self._lock:
+            link = self._link
+            self._link = None
         if link is not None:
+            try:
+                link.cancel_read()
+            except Exception:
+                pass
             try:
                 link.close()
             except Exception:
                 pass
+        reader = self._reader
+        if reader is not None and reader is not threading.current_thread() and reader.is_alive():
+            reader.join(timeout=1.0)
         with self._lock:
             was_connected = self.connected or self.joint_source == "firmware"
             self.connected = False
@@ -426,10 +470,10 @@ class MotionController:
     def jog(self, joint: str, delta: float) -> MoveResult:
         return self._submit(_Job("jog", {"joint": joint, "delta": delta}, queue.Queue()))
 
-    def gripper_action(self, action: str) -> MoveResult:
-        if action not in {"open", "close"}:
-            return MoveResult(ok=False, detail="Gripper action must be open or close.")
-        return self._submit(_Job("gripper", {"action": action}, queue.Queue()))
+    def cylinder_action(self, action: str) -> MoveResult:
+        if action not in {"park", "sample"}:
+            return MoveResult(ok=False, detail="Cylinder action must be park or sample.")
+        return self._submit(_Job("cylinder", {"action": action}, queue.Queue()))
 
     def home(self) -> MoveResult:
         return self._submit(_Job("home", {}, queue.Queue()))
@@ -532,8 +576,8 @@ class MotionController:
                 )
             if job.kind == "jog":
                 return self._run_jog(job.payload["joint"], job.payload["delta"])
-            if job.kind == "gripper":
-                return self._run_gripper(job.payload["action"])
+            if job.kind == "cylinder":
+                return self._run_cylinder(job.payload["action"])
             if job.kind == "home":
                 return self._run_home()
             if job.kind == "status":
@@ -615,9 +659,9 @@ class MotionController:
         sent: list[str] = []
         current = self._current()
         gripper_i = int(round(gripper))
-        if abs(current["gripper"] - gripper_i) >= 1:
-            outcome = self._command_joint("gripper", gripper_i, slow)
-            sent.append(f"gripper rotate {gripper_i}")
+        if abs(current["cylinder"] - gripper_i) >= 1:
+            outcome = self._command_joint("cylinder", gripper_i, slow)
+            sent.append(f"cylinder rotate {gripper_i}")
             if not outcome.ok:
                 outcome.commands = sent
                 return outcome
@@ -698,25 +742,24 @@ class MotionController:
             return MoveResult(ok=True, detail="Already at that angle.")
         return self._command_joint(joint, angle, slow=False)
 
-    def _run_gripper(self, action: str) -> MoveResult:
+    def _run_cylinder(self, action: str) -> MoveResult:
         problem = self._guard()
         if problem:
             return MoveResult(ok=False, interrupted=problem == "Cancelled by stop.", detail=problem)
-        if action in {"park", "open"}:
+        if action == "park":
             angle = int(round(self.cfg.tool.park_servo_deg))
-        elif action in {"sample", "close"}:
+        elif action == "sample":
             angle = int(round(self.cfg.tool.sample_servo_deg))
         else:
-            return MoveResult(ok=False, detail="Cover action must be park or sample.")
-        # M6 stays the firmware's gripper channel. The line is "gripper rotate <angle>".
-        return self._command_joint("gripper", angle, slow=False)
+            return MoveResult(ok=False, detail="Cylinder action must be park or sample.")
+        return self._command_joint("cylinder", angle, slow=False)
 
     def _run_home(self) -> MoveResult:
         problem = self._guard()
         if problem:
             return MoveResult(ok=False, interrupted=problem == "Cancelled by stop.", detail=problem)
         if self.mode != "armed":
-            return self._run_pose(self.cfg.park.angles(), self.cfg.gripper_open, slow=False)
+            return self._run_pose(self.cfg.park.angles(), self.cfg.tool.park_servo_deg, slow=False)
         outcome = self._exchange("home", self.cfg.motion_timeout_s)
         if outcome["kind"] != "done":
             return self._outcome_to_result(outcome, "home")
@@ -741,6 +784,11 @@ class MotionController:
         return MoveResult(ok=True, detail="Status synchronized.")
 
     def _command_joint(self, joint: str, angle: int, slow: bool) -> MoveResult:
+        if joint == "cylinder" and angle not in {
+            int(round(self.cfg.tool.sample_servo_deg)),
+            int(round(self.cfg.tool.park_servo_deg)),
+        }:
+            return MoveResult(ok=False, detail="The cylinder only moves to 10° (sample) or 73° (park).")
         line = f"{joint} rotate {angle}"
         if self.mode != "armed":
             return self._simulate_joint(joint, angle, slow, line)
@@ -761,6 +809,13 @@ class MotionController:
         self._record_uart(line)
         start = float(self._current()[joint])
         if int(round(start)) == angle:
+            return MoveResult(ok=True, detail="DONE", commands=[line])
+        if joint == "cylinder":
+            with self._lock:
+                self._angles[joint] = angle
+                self.joint_source = "simulated"
+                self.joints_known = True
+            self._notify()
             return MoveResult(ok=True, detail="DONE", commands=[line])
         duration = self.cfg.sim_joint_s * (2.2 if slow else 1.0)
         rate = self.cfg.pose_hz if self.cfg.pose_hz > 1 else 30
@@ -841,18 +896,77 @@ class MotionController:
             return MoveResult(ok=False, uncertain=True, detail=detail, commands=[line])
         return MoveResult(ok=False, detail=detail, commands=[line])
 
+    def _acquire_hardware(self, port: str) -> SerialLink:
+        """Open the Uno and wait through its USB reset until the sketch prints READY.
+
+        Opening the port resets the board, and a second program holding the same
+        device makes readline fail. Retry inside the ready window, and always
+        close a port that did not answer so the next attempt can take it.
+        """
+        try:
+            import serial
+        except ImportError as exc:
+            raise MotionRejected("pyserial is not installed.") from exc
+        deadline = time.time() + self.cfg.ready_timeout_s
+        last = "the board did not answer"
+        while time.time() < deadline:
+            try:
+                raw = serial.Serial(port, self.cfg.baud, timeout=0.2, exclusive=True)
+            except Exception as exc:
+                last = str(exc).strip() or exc.__class__.__name__
+                time.sleep(0.25)
+                continue
+            try:
+                if self._read_token(raw, self.cfg.ready_token, deadline):
+                    return SerialLink(raw=raw)
+                last = "no READY Braccio UART"
+            except Exception as exc:
+                last = str(exc).strip() or exc.__class__.__name__
+            try:
+                raw.close()
+            except Exception:
+                pass
+            time.sleep(0.25)
+        message = self._connect_failure(port, last)
+        self.last_error = message
+        raise MotionRejected(message)
+
+    def _read_token(self, raw, token: str, deadline: float) -> bool:
+        while time.time() < deadline:
+            line = raw.readline()
+            if not getattr(raw, "is_open", True):
+                return False
+            if line.decode(errors="replace").strip() == token:
+                return True
+        return False
+
+    def _connect_failure(self, port: str, last: str) -> str:
+        lowered = last.lower()
+        if any(word in lowered for word in ("busy", "multiple access", "resource busy")):
+            return (
+                f"{port} is already open in another program. "
+                "Quit that program, then connect again. "
+                f"({last})"
+            )
+        return (
+            "Did not receive READY Braccio UART. The board may still be resetting, "
+            f"or the sketch is not this firmware. Last port error: {last}"
+        )
+
     def _reader_loop(self) -> None:
         while self._reader_alive and self._link is not None:
             link = self._link
             try:
                 raw = link.readline()
-            except Exception:
-                self._on_disconnect("Serial reader failed.")
+            except Exception as exc:
+                if self._reader_alive and link is self._link:
+                    self._drop_link(f"Serial reader failed: {exc}")
                 break
-            if link is not self._link:
+            if not self._reader_alive or link is not self._link:
                 break
             if not link.is_open:
-                self._on_disconnect("Serial port closed.")
+                if self._reader_alive:
+                    self._drop_link("Serial port closed.")
                 break
             if not raw:
                 continue
@@ -881,6 +995,18 @@ class MotionController:
             if text == token:
                 return text
         return None
+
+    def _drop_link(self, detail: str) -> None:
+        self._reader_alive = False
+        with self._lock:
+            link = self._link
+            self._link = None
+        if link is not None:
+            try:
+                link.close()
+            except Exception:
+                pass
+        self._on_disconnect(detail)
 
     def _on_disconnect(self, detail: str) -> None:
         with self._lock:
@@ -949,7 +1075,7 @@ class MotionController:
             raise MotionRejected("Simulated park is only used in dry-run.")
         with self._lock:
             self._angles = dict(self.cfg.park.angles())
-            self._angles["gripper"] = self.cfg.gripper_open
+            self._angles["cylinder"] = self.cfg.tool.park_servo_deg
             self.joints_known = True
             self.joint_source = "simulated"
             self.needs_status_sync = False

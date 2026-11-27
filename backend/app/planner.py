@@ -795,7 +795,7 @@ def _extract_targets(text: str) -> list[TargetSpec]:
         specs.append(TargetSpec(color=color, kind=kind, phrase=phrase))
     if not specs:
         for word in re.findall(r"\b(?:the|a|an)\s+([a-z]+)", stripped):
-            if word in {"table", "arm", "robot", "gripper", "camera", "it", "them", "left", "right", "center", "front"}:
+            if word in {"table", "arm", "robot", "gripper", "cylinder", "cover", "camera", "it", "them", "left", "right", "center", "front"}:
                 continue
             specs.append(TargetSpec(color=None, kind=None, phrase=word))
     return _dedupe_overlapping(specs)

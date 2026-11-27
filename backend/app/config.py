@@ -18,7 +18,7 @@ JOINTS = (
     "elbow",
     "wrist_vertical",
     "wrist_rotation",
-    "gripper",
+    "cylinder",
 )
 ARM_JOINTS = JOINTS[:5]
 
@@ -91,7 +91,7 @@ class CoverTool:
     park_servo_deg: float = 73
     sample_servo_deg: float = 10
     design_tilt_at_park_deg: float = -63
-    design_tilt_at_sample_deg: float = 0
+    design_tilt_at_sample_deg: float = -38
     angles_calibrated: bool = False
     approach_clearance_mm: float = 40
     seal_standoff_mm: float = 0
@@ -264,8 +264,8 @@ class Config:
             forbidden_elbow_below=float(space["forbidden_elbow_below"]),
             forbidden_shoulder_above=float(space["forbidden_shoulder_above"]),
             joint_limits=limits,
-            gripper_open=float(data["joints"]["gripper"]["open"]),
-            gripper_closed=float(data["joints"]["gripper"]["closed"]),
+            gripper_open=float(data["joints"]["cylinder"]["open"]),
+            gripper_closed=float(data["joints"]["cylinder"]["closed"]),
             park=_pose(poses["park"]),
             sample=_pose(poses["sample"]),
             scan=[_pose(item) for item in poses["scan"]],
@@ -326,16 +326,16 @@ def validate_taught_poses(cfg: Config) -> list[str]:
             errors.append(f"{name}: {problem}")
         problem = pose_problem(pose.angles(), cfg, gripper=cfg.gripper_closed)
         if problem:
-            errors.append(f"{name} with gripper closed: {problem}")
+            errors.append(f"{name} with the cylinder at its other limit: {problem}")
     low, high = cfg.joint_limits["shoulder"]
     if not low <= cfg.transit_shoulder <= high:
         errors.append("transit_shoulder is outside the shoulder limits")
-    lo, hi = cfg.joint_limits["gripper"]
+    lo, hi = cfg.joint_limits["cylinder"]
     for label, angle in (("park", cfg.tool.park_servo_deg), ("sample", cfg.tool.sample_servo_deg)):
         if not lo <= angle <= hi:
             errors.append(f"cover {label} servo {angle} is outside {lo}–{hi}")
     for obj in cfg.objects.values():
-        lo, hi = cfg.joint_limits["gripper"]
+        lo, hi = cfg.joint_limits["cylinder"]
         if not lo <= obj.close_angle <= hi:
             errors.append(f"{obj.id} close_angle {obj.close_angle} is outside {lo}–{hi}")
         if obj.zone and obj.zone not in cfg.zones:

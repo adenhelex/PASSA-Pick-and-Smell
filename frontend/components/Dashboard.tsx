@@ -117,8 +117,6 @@ export default function Dashboard() {
   const wasRunning = useRef(false);
   const askForVoiceCommandRef = useRef<() => Promise<void>>(async () => undefined);
   const [offset, setOffset] = useState({ x: 1, y: 1, z: 1 });
-  const [coverPark, setCoverPark] = useState("73");
-  const [coverSample, setCoverSample] = useState("10");
   const [coverHold, setCoverHold] = useState("10");
   const offsetReady = useRef(false);
   const offsetTimer = useRef(0);
@@ -159,13 +157,6 @@ export default function Dashboard() {
     });
     offsetReady.current = true;
   }, [state?.settings]);
-
-  useEffect(() => {
-    const tool = state?.settings.tool;
-    if (!tool) return;
-    setCoverPark(String(tool.park_servo_deg));
-    setCoverSample(String(tool.sample_servo_deg));
-  }, [state?.settings.tool?.park_servo_deg, state?.settings.tool?.sample_servo_deg]);
 
   useEffect(() => {
     const seconds = state?.settings.sample_hold_s;
@@ -595,7 +586,7 @@ export default function Dashboard() {
             </span>
           </header>
           <ArmView
-            angles={robot?.angles ?? { base: null, shoulder: null, elbow: null, wrist_vertical: null, wrist_rotation: null, gripper: null }}
+            angles={robot?.angles ?? { base: null, shoulder: null, elbow: null, wrist_vertical: null, wrist_rotation: null, cylinder: null }}
             jointsKnown={Boolean(robot?.joints_known)}
             items={state?.observation.items ?? []}
             selectedId={state?.observation.selected_id ?? null}
@@ -998,7 +989,7 @@ export default function Dashboard() {
               <p className="meta">
                 {armed ? "Hardware" : "Dry-run"}
                 {" · "}
-                Cover tilt {robot?.angles.gripper == null ? "—" : `${Math.round(robot.angles.gripper)}°`}
+                Cylinder {robot?.angles.cylinder == null ? "—" : `${Math.round(robot.angles.cylinder)}°`}
                 {" · "}
                 {mission?.phase || "idle"}
                 {mission?.record.selected ? ` · ${mission.record.selected.name}` : ""}
@@ -1011,40 +1002,7 @@ export default function Dashboard() {
                 </p>
               )}
               <div className="cover-angles">
-                <label>
-                  Park angle
-                  <input
-                    type="number"
-                    min={10}
-                    max={73}
-                    step={1}
-                    aria-label="Cover park angle"
-                    value={coverPark}
-                    disabled={busy || active}
-                    onChange={(event) => setCoverPark(event.target.value)}
-                    onBlur={() => {
-                      const value = Number(coverPark);
-                      if (Number.isFinite(value)) void call("/api/settings", { cover_park_deg: value });
-                    }}
-                  />
-                </label>
-                <label>
-                  Sampling angle
-                  <input
-                    type="number"
-                    min={10}
-                    max={73}
-                    step={1}
-                    aria-label="Cover sampling angle"
-                    value={coverSample}
-                    disabled={busy || active}
-                    onChange={(event) => setCoverSample(event.target.value)}
-                    onBlur={() => {
-                      const value = Number(coverSample);
-                      if (Number.isFinite(value)) void call("/api/settings", { cover_sample_deg: value });
-                    }}
-                  />
-                </label>
+                <p className="meta">Cylinder park 73° · sample 10°. The rim meets the table at 10°.</p>
                 <label>
                   Cover hold (s)
                   <input
@@ -1235,10 +1193,10 @@ export default function Dashboard() {
               {active && <p className="warn">Manual jog is disabled during an active mission.</p>}
               <div className="row">
                 <button disabled={busy || active} onClick={() => call("/api/home")}>Home</button>
-                <button disabled={busy || active} onClick={() => call("/api/gripper", { action: "park" })}>Cover park</button>
-                <button disabled={busy || active} onClick={() => call("/api/gripper", { action: "sample" })}>Cover sample</button>
+                <button disabled={busy || active} onClick={() => call("/api/cylinder", { action: "park" })}>Cylinder park</button>
+                <button disabled={busy || active} onClick={() => call("/api/cylinder", { action: "sample" })}>Cylinder sample</button>
               </div>
-              {JOINTS.map((joint) => (
+              {JOINTS.filter((joint) => joint.key !== "cylinder").map((joint) => (
                 <div key={joint.key} className="jog">
                   <span>{joint.label}</span>
                   <span>
@@ -1295,11 +1253,8 @@ export default function Dashboard() {
                   <div className="row">
                     <button
                       type="button"
-                      disabled={busy || active}
-                      onClick={() => {
-                        if (!window.confirm("Opening the port can reset the Arduino Uno and command its home pose. Connect?")) return;
-                        call("/api/serial/connect", { port: draft.serial_port, confirm_reset: true });
-                      }}
+                      disabled={busy || active || !draft.serial_port}
+                      onClick={() => void connectSerial(draft.serial_port)}
                     >
                       Connect
                     </button>
